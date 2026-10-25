@@ -1,45 +1,224 @@
 #include "preference_manager.hpp"
 
+#include "core/status.hpp"
+
 #include "platform/file_dialog.hpp"
+#include "platform/platform_config.hpp"
+#include "workspace/path_policy.hpp"
+#if defined(MEGATOY_PLATFORM_WEB)
+#include "platform/web/web_folder_import.hpp"
+#include "platform/web/web_storage_bootstrap.hpp"
+#else
+#include "patches/background_folder_scan.hpp"
+#include "patches/legacy_metadata_migration.hpp"
+#endif
 #include "preference_storage.hpp"
 #include <cstdlib>
 #include <iostream>
+#include <system_error>
 
 PreferenceManager::PreferenceManager(megatoy::system::PathService &paths)
     : paths_(paths), directories_initialized(false),
       theme_(ui::styles::ThemeId::MegatoyDark),
       storage_(make_json_preference_storage(get_preferences_file_path(),
                                             paths_.file_system())) {
-  paths_.set_data_root(get_default_data_directory());
-  load_preferences();
   ensure_directories_exist();
+  load_preferences();
+
+#if defined(MEGATOY_PLATFORM_WEB)
+  // The browser has no folder for the user to point at, so the workspace is
+  // seeded with a writable one inside persistent storage.
+  if (platform::web::bootstrap_workspace(
+          workspace_, megatoy::system::PathService::web_storage_root())) {
+    save_preferences();
+  }
+#endif
 }
 
 PreferenceManager::~PreferenceManager() { platform::file_dialog::shutdown(); }
 
-std::filesystem::path PreferenceManager::get_default_data_directory() const {
-  return megatoy::system::PathService::default_data_directory();
+bool PreferenceManager::add_workspace_folder(
+    const std::filesystem::path &path) {
+  if (!workspace_.add(path)) {
+    return false;
+  }
+  migrate_legacy_metadata();
+  save_preferences();
+  return true;
 }
 
-void PreferenceManager::set_data_directory(const std::filesystem::path &path) {
-  paths_.set_data_root(path);
-  ensure_directories_exist();
+bool PreferenceManager::remove_workspace_folder(
+    const std::filesystem::path &path) {
+  if (workspace_folder_is_protected(path)) {
+    megatoy::status::error("\"My Patches\" cannot be removed.");
+    return false;
+  }
+  if (!workspace_.remove(path)) {
+    return false;
+  }
+  save_preferences();
+  return true;
+}
+
+bool PreferenceManager::rename_workspace_folder(const std::filesystem::path &from,
+                                                const std::filesystem::path &to) {
+  if (workspace_folder_is_protected(from)) {
+    return false;
+  }
+  if (!workspace_.rename(from, to)) {
+    return false;
+  }
+  save_preferences();
+  return true;
+}
+
+bool PreferenceManager::workspace_folder_is_protected(
+    const std::filesystem::path &path) const {
+#if defined(MEGATOY_PLATFORM_WEB)
+  return megatoy::workspace::paths_equal(
+      path, platform::web::default_workspace_folder());
+#else
+  (void)path;
+  return false;
+#endif
+}
+
+bool PreferenceManager::reorder_workspace_folder(std::size_t from,
+                                                 std::size_t to) {
+  if (!workspace_.reorder(from, to)) {
+    return false;
+  }
+  save_preferences();
+  return true;
+}
+
+bool PreferenceManager::refresh_workspace_availability() {
+  return workspace_.refresh();
+}
+
+bool PreferenceManager::folder_add_is_import() {
+#if defined(MEGATOY_PLATFORM_WEB)
+  return true;
+#else
+  return false;
+#endif
+}
+
+void PreferenceManager::request_add_workspace_folder(
+    std::function<void()> on_changed) {
+#if defined(MEGATOY_PLATFORM_WEB)
+  platform::web::import_folder(
+      megatoy::system::PathService::web_storage_root(),
+      [this, on_changed](platform::web::FolderImportResult result) {
+        if (result.cancelled) {
+          return;
+        }
+        if (!result.ok) {
+          megatoy::status::error("Folder import failed: " + result.error);
+          return;
+        }
+        if (add_workspace_folder(result.path)) {
+          if (result.filtered_count == 0 &&
+              result.validation_failures.empty()) {
+            megatoy::status::success(
+                "Imported \"" + result.folder_name + "\" (" +
+                std::to_string(result.file_count) + " files)");
+          }
+          if (on_changed) {
+            on_changed();
+          }
+        } else {
+          megatoy::status::warning("\"" + result.folder_name +
+                                   "\" is already in the workspace.");
+        }
+      });
+#else
+  std::filesystem::path chosen;
+  const auto start = last_save_directory();
+  if (platform::file_dialog::pick_folder(start, chosen) !=
+      platform::file_dialog::DialogResult::Ok) {
+    return;
+  }
+
+  // Warm the parse cache on a worker before the folder joins the workspace:
+  // the sync that follows re-walks it on the UI thread, and for a folder of
+  // thousands of banks that first parse is a freeze measured in seconds.
+  // Warm the same path the workspace will store, or the cache keys miss.
+  const auto folder = megatoy::workspace::normalize_path(chosen);
+  const std::string folder_name = folder.filename().string();
+  const bool started = patches::background_folder_scan::begin(
+      folder, [this, folder, folder_name, on_changed](bool cancelled) {
+        if (cancelled) {
+          megatoy::status::info("Folder scan cancelled.");
+          return;
+        }
+        if (add_workspace_folder(folder)) {
+          if (on_changed) {
+            on_changed();
+          }
+        } else {
+          megatoy::status::warning("\"" + folder_name +
+                                   "\" is already in the workspace.");
+        }
+      });
+  if (!started) {
+    megatoy::status::warning("Another folder scan is in progress.");
+  }
+#endif
+}
+
+void PreferenceManager::set_show_builtin_presets(bool show) {
+  if (show == show_builtin_presets_) {
+    return;
+  }
+  show_builtin_presets_ = show;
   save_preferences();
 }
 
-std::filesystem::path PreferenceManager::get_data_directory() const {
-  return paths_.paths().data_root;
+std::filesystem::path PreferenceManager::last_save_directory() const {
+  if (!last_save_directory_.empty()) {
+    std::error_code ec;
+    if (std::filesystem::is_directory(last_save_directory_, ec) && !ec) {
+      return last_save_directory_;
+    }
+  }
+  if (auto folder = workspace_.default_save_folder()) {
+    return *folder;
+  }
+  return megatoy::system::PathService::default_documents_directory();
 }
 
-bool PreferenceManager::select_data_directory() {
-  std::filesystem::path chosen_path;
-  auto result =
-      platform::file_dialog::pick_folder(get_data_directory(), chosen_path);
-  if (result == platform::file_dialog::DialogResult::Ok) {
-    set_data_directory(chosen_path);
-    return true;
+void PreferenceManager::set_last_save_directory(
+    const std::filesystem::path &path) {
+  if (path.empty() || path == last_save_directory_) {
+    return;
   }
-  return result != platform::file_dialog::DialogResult::Error;
+  last_save_directory_ = path;
+  save_preferences();
+}
+
+const std::string &PreferenceManager::last_patch_path() const {
+  return last_patch_path_;
+}
+
+void PreferenceManager::set_last_patch_path(const std::string &path) {
+  if (path == last_patch_path_) {
+    return;
+  }
+  last_patch_path_ = path;
+  save_preferences();
+}
+
+const std::string &PreferenceManager::last_seen_version() const {
+  return last_seen_version_;
+}
+
+void PreferenceManager::set_last_seen_version(const std::string &version) {
+  if (version == last_seen_version_) {
+    return;
+  }
+  last_seen_version_ = version;
+  save_preferences();
 }
 
 bool PreferenceManager::ensure_directories_exist() {
@@ -72,20 +251,46 @@ bool PreferenceManager::load_preferences() {
     return false;
   }
 
-  apply_loaded_data(data);
-  return true;
-}
+#if !defined(MEGATOY_PLATFORM_WEB)
+  if (!data.legacy_workspace_migration_complete) {
+    // Old releases created this tree without necessarily writing preferences.
+    // The first workspace release could also save workspace_folders: [] after
+    // discarding data_directory, so only our dedicated marker proves that the
+    // one-time compatibility check has already run.
+    if (data.workspace_folders.empty()) {
+      const auto legacy =
+          megatoy::system::PathService::legacy_default_patches_directory();
+      std::error_code error;
+      if (paths_.file_system().is_directory(legacy, error)) {
+        data.workspace_folders = {legacy};
+      } else if (error) {
+        std::cerr << "Legacy workspace migration will be retried: "
+                  << error.message() << "\n";
+        apply_loaded_data(data);
+        return true;
+      }
+    }
+    data.legacy_workspace_migration_complete = true;
+    data.migrated_legacy_workspace = true;
+  }
+#endif
 
-void PreferenceManager::reset_data_directory() {
-  paths_.set_data_root(get_default_data_directory());
-  ensure_directories_exist();
-  save_preferences();
+  apply_loaded_data(data);
+  const bool metadata_migrated =
+      migrate_legacy_metadata(data.legacy_metadata_workspace);
+  if (data.migrated_legacy_workspace || metadata_migrated) {
+    // Rewrite immediately so the migration is one-shot.
+    return save_preferences();
+  }
+  return true;
 }
 
 void PreferenceManager::reset_ui_preferences() {
   const auto current = ui_preferences_;
   ui_preferences_ = {};
   ui_preferences_.use_velocity = current.use_velocity;
+  ui_preferences_.velocity_sensitivity_depth =
+      current.velocity_sensitivity_depth;
   ui_preferences_.steal_oldest_note_when_full =
       current.steal_oldest_note_when_full;
   ui_preferences_.midi_keyboard_layout = current.midi_keyboard_layout;
@@ -132,14 +337,51 @@ void PreferenceManager::set_ui_preferences(
 
 PreferenceData PreferenceManager::to_data() const {
   PreferenceData data;
-  data.data_directory = paths_.paths().data_root;
+  data.workspace_folders = workspace_.paths();
+  data.last_save_directory = last_save_directory_;
+  data.last_patch_path = last_patch_path_;
+  data.last_seen_version = last_seen_version_;
+  data.show_builtin_presets = show_builtin_presets_;
+  data.legacy_workspace_migration_complete =
+      legacy_workspace_migration_complete_;
+  data.legacy_metadata_migration_complete = legacy_metadata_migration_complete_;
   data.theme = theme_;
   data.ui_preferences = ui_preferences_;
   return data;
 }
 
 void PreferenceManager::apply_loaded_data(const PreferenceData &data) {
-  paths_.set_data_root(data.data_directory);
+  workspace_.set_paths(data.workspace_folders);
+  last_save_directory_ = data.last_save_directory;
+  last_patch_path_ = data.last_patch_path;
+  last_seen_version_ = data.last_seen_version;
+  show_builtin_presets_ = data.show_builtin_presets;
+  legacy_workspace_migration_complete_ =
+      data.legacy_workspace_migration_complete;
+  legacy_metadata_migration_complete_ = data.legacy_metadata_migration_complete;
   theme_ = data.theme;
   ui_preferences_ = data.ui_preferences;
+}
+
+bool PreferenceManager::migrate_legacy_metadata(
+    const std::filesystem::path &preferred_workspace) {
+#if defined(MEGATOY_PLATFORM_WEB)
+  (void)preferred_workspace;
+  return false;
+#else
+  if (legacy_metadata_migration_complete_) {
+    return false;
+  }
+  const auto result = patches::migrate_legacy_metadata(
+      paths_.paths().legacy_patch_metadata_db, workspace_, preferred_workspace);
+  if (!result.complete) {
+    if (!result.error.empty()) {
+      std::cerr << "Legacy patch metadata migration will be retried: "
+                << result.error << "\n";
+    }
+    return false;
+  }
+  legacy_metadata_migration_complete_ = true;
+  return true;
+#endif
 }

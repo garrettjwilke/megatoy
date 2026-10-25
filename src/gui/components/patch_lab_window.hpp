@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace ui {
 
@@ -20,12 +21,21 @@ struct PatchLabContext {
 };
 
 struct PatchLabState {
+  struct SessionResult {
+    std::uint64_t id = 0;
+    std::string label;
+    std::string created_at;
+    ym2612::Patch patch;
+  };
+
+  // Generated patches live only for this app session. New results are
+  // inserted at the front so the most recent experiment is always visible.
+  std::vector<SessionResult> results;
+  std::uint64_t next_result_id = 1;
 
   // Randomize
   int random_seed = -1;
   int random_template_iterations = 4;
-  std::uint32_t random_last_seed = 0;
-  bool random_has_result = false;
 
   // Shared sources for blend/morph
   const patches::PatchEntry *source_a = nullptr;
@@ -40,9 +50,6 @@ struct PatchLabState {
   std::string morph_error;
 
   // Mutate
-  int mutate_seed = -1;
-  std::uint32_t mutate_last_seed = 0;
-  bool mutate_has_result = false;
   int mutate_amount = 2;
   float mutate_probability = 0.35f;
   bool mutate_allow_algorithm_change = true;
@@ -50,6 +57,10 @@ struct PatchLabState {
   // Combo filter states
   std::string combo_filter_patch_a;
   std::string combo_filter_patch_b;
+  // Widest the open list has been, so filtering cannot pull it narrower
+  // mid-search. Reset when the list closes.
+  float combo_width_patch_a = 0.0f;
+  float combo_width_patch_b = 0.0f;
 };
 
 void render_patch_lab(const char *title, PatchLabContext &context,

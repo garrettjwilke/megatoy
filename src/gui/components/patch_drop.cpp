@@ -1,43 +1,32 @@
 #include "patch_drop.hpp"
+#include "common.hpp"
+#include "modal.hpp"
 #include <algorithm>
 #include <imgui.h>
 
 namespace ui {
 namespace {
-constexpr const char *kErrorPopupTitle = "Patch Load Error";
 constexpr const char *kInstrumentPopupTitle = "Select Instrument";
 constexpr const char *kFallbackErrorMessage = "Unsupported file format.";
 } // namespace
 
+// Load failures are announced as status toasts; only the instrument picker
+// -- an actual decision -- still opens a dialog.
 void render_patch_drop_feedback(PatchDropContext &context) {
   auto &drop = context.drop_state;
-
-  if (drop.show_error_popup) {
-    ImGui::OpenPopup(kErrorPopupTitle);
-    drop.show_error_popup = false;
-  }
 
   if (drop.show_picker_for_multiple_instruments) {
     ImGui::OpenPopup(kInstrumentPopupTitle);
     drop.show_picker_for_multiple_instruments = false;
   }
 
-  if (ImGui::BeginPopupModal(kErrorPopupTitle, nullptr,
-                             ImGuiWindowFlags_AlwaysAutoResize)) {
-    const char *message = drop.error_message.empty()
-                              ? kFallbackErrorMessage
-                              : drop.error_message.c_str();
-    ImGui::TextWrapped("%s", message);
-    if (ImGui::Button("OK", ImVec2(120, 0))) {
-      drop.error_message.clear();
-      ImGui::CloseCurrentPopup();
-    }
-    ImGui::SetItemDefaultFocus();
-    ImGui::EndPopup();
+  // Escape cancels: picking nothing means the dropped file is not loaded,
+  // which is what Cancel does.
+  auto picker = begin_modal(kInstrumentPopupTitle, ModalDismiss::Escape);
+  if (picker.dismissed && context.cancel_selection) {
+    context.cancel_selection();
   }
-
-  if (ImGui::BeginPopupModal(kInstrumentPopupTitle, nullptr,
-                             ImGuiWindowFlags_AlwaysAutoResize)) {
+  if (picker.visible) {
     if (!drop.instruments.empty()) {
       drop.selected_instrument =
           std::clamp(drop.selected_instrument, 0,
@@ -62,14 +51,15 @@ void render_patch_drop_feedback(PatchDropContext &context) {
         ImGui::EndCombo();
       }
 
-      if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+      align_buttons_right({dialog_button_width(), dialog_button_width()});
+      if (ImGui::Button("Cancel", ImVec2(dialog_button_width(), 0))) {
         if (context.cancel_selection) {
           context.cancel_selection();
         }
         ImGui::CloseCurrentPopup();
       }
       ImGui::SameLine();
-      if (ImGui::Button("Load", ImVec2(120, 0))) {
+      if (ImGui::Button("Load", ImVec2(dialog_button_width(), 0))) {
         if (context.apply_selection) {
           context.apply_selection(
               static_cast<size_t>(drop.selected_instrument));
@@ -78,7 +68,8 @@ void render_patch_drop_feedback(PatchDropContext &context) {
       }
     } else {
       ImGui::TextUnformatted(kFallbackErrorMessage);
-      if (ImGui::Button("OK", ImVec2(120, 0))) {
+      align_buttons_right({dialog_button_width()});
+      if (ImGui::Button("OK", ImVec2(dialog_button_width(), 0))) {
         if (context.cancel_selection) {
           context.cancel_selection();
         }
@@ -86,7 +77,7 @@ void render_patch_drop_feedback(PatchDropContext &context) {
       }
     }
 
-    ImGui::EndPopup();
+    end_modal();
   } else if (!drop.instruments.empty() &&
              !ImGui::IsPopupOpen(kInstrumentPopupTitle)) {
     if (context.cancel_selection) {

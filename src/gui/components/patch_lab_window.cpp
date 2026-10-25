@@ -1,13 +1,18 @@
 #include "patch_lab_window.hpp"
 
 #include "common.hpp"
+#include "gui/ui_scale.hpp"
 #include "imgui_internal.h"
 #include "patches/patch_lab.hpp"
 #include <IconsFontAwesome7.h>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cmath>
 #include <cstring>
+#include <ctime>
 #include <imgui.h>
+#include <utility>
 #include <vector>
 
 namespace ui {
@@ -80,14 +85,26 @@ std::string combo_preview_label(EntryPtr selection,
 
 bool render_patch_combo(const char *label,
                         const std::vector<EntryDisplay> &entries,
-                        EntryPtr &selection, std::string &filter_text) {
+                        EntryPtr &selection, std::string &filter_text,
+                        float &min_width) {
   const std::string preview = combo_preview_label(selection, entries);
   bool changed = false;
   bool filter_active = !filter_text.empty();
 
+  // The list sizes itself to its widest row, so filtering it would pull it
+  // narrower while the user is still typing into it. The width from before
+  // the search is held as a floor until the list closes. The ceiling is for
+  // the other direction: one very long patch name would otherwise open a
+  // list wider than the window it is in.
+  ImGui::SetNextWindowSizeConstraints(
+      ImVec2(min_width, 0.0f),
+      ImVec2(ImGui::GetMainViewport()->WorkSize.x * 0.6f, FLT_MAX));
+
   if (ImGui::BeginCombo(label, preview.c_str())) {
-    // Add filter input at the top of the combo
-    ImGui::SetNextItemWidth(-1.0f);
+    // -FLT_MIN, not -1.0f: a negative width is relative to what is
+    // available, so -1.0f makes this the widest content by one pixel less
+    // each frame, and the list creeps narrower for as long as it is open.
+    ImGui::SetNextItemWidth(-FLT_MIN);
 
     // Use char buffer for ImGui compatibility
     static char filter_buffer[256];
@@ -137,7 +154,11 @@ bool render_patch_combo(const char *label,
       }
     }
 
+    min_width = std::max(min_width, ImGui::GetWindowWidth());
     ImGui::EndCombo();
+  } else {
+    // Closed: forget it, so the next open measures the list afresh.
+    min_width = 0.0f;
   }
   return changed;
 }
@@ -161,7 +182,8 @@ void apply_patch_result(PatchLabContext &context,
   }
 
   session.current_patch() = new_patch;
-  session.current_patch().name = before.name;
+  session.current_patch().name.clear();
+  session.set_current_patch_path({});
   session.apply_patch_to_audio();
 
   if (context.commit_history) {
@@ -169,11 +191,30 @@ void apply_patch_result(PatchLabContext &context,
   }
 }
 
+void remember_result(PatchLabState &state, std::string label,
+                     const ym2612::Patch &patch) {
+  const auto now = std::chrono::system_clock::now();
+  const std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+  std::tm local_time{};
+#if defined(_WIN32)
+  localtime_s(&local_time, &now_time);
+#else
+  localtime_r(&now_time, &local_time);
+#endif
+  char time_text[9]{};
+  std::strftime(time_text, sizeof(time_text), "%H:%M:%S", &local_time);
+
+  state.results.insert(state.results.begin(), {.id = state.next_result_id++,
+                                               .label = std::move(label),
+                                               .created_at = time_text,
+                                               .patch = patch});
+}
+
 void render_random_section(PatchLabContext &context, PatchLabState &state) {
   ImGui::TextWrapped("Generates a new patch each time.");
   ImGui::Spacing();
 
-  ImGui::SetNextItemWidth(120.0f);
+  ImGui::SetNextItemWidth(ui::scale::px(120.0f));
   ImGui::InputInt("Seed (auto = -1)", &state.random_seed);
 
   if (ImGui::Button("Apply to current patch")) {
@@ -186,13 +227,9 @@ void render_random_section(PatchLabContext &context, PatchLabState &state) {
 
     auto result = patch_lab::random_patch(options);
     const auto key = "patch_lab.random: " + std::to_string(result.seed);
+    remember_result(state, "Random (Seed: " + std::to_string(result.seed) + ")",
+                    result.patch);
     apply_patch_result(context, "Patch Lab Randomize", key, result.patch);
-    state.random_last_seed = result.seed;
-    state.random_has_result = true;
-  }
-
-  if (state.random_has_result) {
-    ImGui::Text("Last seed: %u", state.random_last_seed);
   }
 }
 
@@ -214,11 +251,11 @@ void render_merge_section(PatchLabContext &context, PatchLabState &state,
   }
 
   render_patch_combo("Patch A", entries, state.source_a,
-                     state.combo_filter_patch_a);
+                     state.combo_filter_patch_a, state.combo_width_patch_a);
   render_patch_combo("Patch B", entries, state.source_b,
-                     state.combo_filter_patch_b);
+                     state.combo_filter_patch_b, state.combo_width_patch_b);
 
-  ImGui::SetNextItemWidth(120.0f);
+  ImGui::SetNextItemWidth(ui::scale::px(120.0f));
   ImGui::InputInt("Seed (auto = -1)##merge", &state.merge_seed);
 
   if (!entries.empty()) {
@@ -236,6 +273,7 @@ void render_merge_section(PatchLabContext &context, PatchLabState &state,
         patch_lab::MergeOptions options;
         options.seed = state.merge_seed;
         auto result = patch_lab::merge(patch_a, patch_b, options);
+        remember_result(state, "Mix", result.patch);
         apply_patch_result(context, "Patch Lab Merge", result.patch.hash(),
                            result.patch);
         state.merge_last_seed = result.seed;
@@ -276,9 +314,9 @@ void render_morph_section(PatchLabContext &context, PatchLabState &state,
   }
 
   render_patch_combo("Patch A##morph", entries, state.source_a,
-                     state.combo_filter_patch_a);
+                     state.combo_filter_patch_a, state.combo_width_patch_a);
   render_patch_combo("Patch B##morph", entries, state.source_b,
-                     state.combo_filter_patch_b);
+                     state.combo_filter_patch_b, state.combo_width_patch_b);
 
   ImGui::SliderFloat("Blend", &state.morph_mix, 0.0f, 1.0f);
   ImGui::Checkbox("Interpolate algorithm", &state.morph_interpolate_algorithm);
@@ -300,6 +338,10 @@ void render_morph_section(PatchLabContext &context, PatchLabState &state,
         options.interpolate_algorithm = state.morph_interpolate_algorithm;
 
         auto result = patch_lab::morph(patch_a, patch_b, options);
+        const int percentage =
+            static_cast<int>(std::lround(state.morph_mix * 100.0f));
+        remember_result(state, "Morph " + std::to_string(percentage) + "%",
+                        result.patch);
         apply_patch_result(context, "Patch Lab Morph", result.patch.hash(),
                            result.patch);
         state.morph_error.clear();
@@ -331,25 +373,38 @@ void render_mutate_section(PatchLabContext &context, PatchLabState &state) {
   ImGui::Checkbox("Allow algorithm change",
                   &state.mutate_allow_algorithm_change);
 
-  ImGui::SetNextItemWidth(120.0f);
-  ImGui::InputInt("Seed (auto = -1)##mutate", &state.mutate_seed);
-
   if (ImGui::Button("Mutate Current Patch")) {
     patch_lab::MutateOptions options;
-    options.seed = state.mutate_seed;
     options.amount = state.mutate_amount;
     options.probability = state.mutate_probability;
     options.allow_algorithm_variation = state.mutate_allow_algorithm_change;
 
     auto before = context.session.current_patch();
-    auto result = patch_lab::mutate_in_place(before, options);
+    patch_lab::mutate_in_place(before, options);
+    remember_result(state, "Mutate", before);
     apply_patch_result(context, "Patch Lab Mutate", before.hash(), before);
-    state.mutate_last_seed = result.seed;
-    state.mutate_has_result = true;
+  }
+}
+
+void render_result_list(PatchLabContext &context, PatchLabState &state) {
+  ImGui::SeparatorText("Results");
+  if (state.results.empty()) {
+    ImGui::TextDisabled("Generated patches appear here.");
+    return;
   }
 
-  if (state.mutate_has_result) {
-    ImGui::Text("Last seed: %u", state.mutate_last_seed);
+  for (const auto &result : state.results) {
+    ImGui::PushID(static_cast<int>(result.id));
+    const std::string display_label = result.label + "  " + result.created_at;
+    if (ImGui::Selectable(display_label.c_str())) {
+      apply_patch_result(context, "Apply Patch Lab Result",
+                         "patch_lab.result:" + std::to_string(result.id),
+                         result.patch);
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Apply to current patch");
+    }
+    ImGui::PopID();
   }
 }
 
@@ -361,35 +416,47 @@ void render_patch_lab(const char *title, PatchLabContext &context,
     return;
   }
 
-  ImGui::SetNextWindowSize(ImVec2(400, 250), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ui::scale::px(ImVec2(700, 320)),
+                           ImGuiCond_FirstUseEver);
 
   if (!ImGui::Begin(title, &context.prefs.show_patch_lab)) {
     ImGui::End();
     return;
   }
 
-  if (ImGui::BeginTabBar("##Patch Lab Operators",
-                         ImGuiTabBarFlags_SaveSettings)) {
-    auto &repository = context.session.repository();
-    auto entries = build_entry_list(repository);
-    if (ImGui::BeginTabItem(ICON_FA_DICE " Random")) {
-      render_random_section(context, state);
-      ImGui::EndTabItem();
+  const float available = ImGui::GetContentRegionAvail().x;
+  const float left_width = std::max(320.0f, available * 0.62f);
+  if (ImGui::BeginChild("##PatchLabControls", ImVec2(left_width, 0), false)) {
+    if (ImGui::BeginTabBar("##Patch Lab Operators",
+                           ImGuiTabBarFlags_SaveSettings)) {
+      auto &repository = context.session.repository();
+      if (ImGui::BeginTabItem(ICON_FA_DICE " Random")) {
+        render_random_section(context, state);
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem(ICON_FA_SHUFFLE " Mix")) {
+        const auto entries = build_entry_list(repository);
+        render_merge_section(context, state, entries);
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem(ICON_FA_FLASK_VIAL " Morph")) {
+        const auto entries = build_entry_list(repository);
+        render_morph_section(context, state, entries);
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem(ICON_FA_VIRUS " Mutate")) {
+        render_mutate_section(context, state);
+        ImGui::EndTabItem();
+      }
+      ImGui::EndTabBar();
     }
-    if (ImGui::BeginTabItem(ICON_FA_SHUFFLE " Mix")) {
-      render_merge_section(context, state, entries);
-      ImGui::EndTabItem();
-    }
-    if (ImGui::BeginTabItem(ICON_FA_FLASK_VIAL " Morph")) {
-      render_morph_section(context, state, entries);
-      ImGui::EndTabItem();
-    }
-    if (ImGui::BeginTabItem(ICON_FA_VIRUS " Mutate")) {
-      render_mutate_section(context, state);
-      ImGui::EndTabItem();
-    }
-    ImGui::EndTabBar();
   }
+  ImGui::EndChild();
+  ImGui::SameLine();
+  if (ImGui::BeginChild("##PatchLabResults", ImVec2(0, 0), true)) {
+    render_result_list(context, state);
+  }
+  ImGui::EndChild();
 
   ImGui::End();
 }

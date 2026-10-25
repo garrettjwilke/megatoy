@@ -1,21 +1,26 @@
 #pragma once
 
+#include "formats/patch_registry.hpp"
+#include "gui/components/operator_commands.hpp"
+#include "gui/patch_save_dialog.hpp"
 #include "gui/save_export_state.hpp"
 #include "input_state.hpp"
 #include "patches/patch_repository.hpp"
 #include "preferences/preference_manager.hpp"
 #include "ym2612/patch.hpp"
 #include <filesystem>
+#include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct UIState {
   PreferenceManager::UIPreferences prefs;
-  bool open_directory_dialog = false;
+  bool open_add_folder_dialog = false;
+  /// Raised to bring up Preferences on its Sound tab.
+  bool open_sound_preferences = false;
 
   struct DropState {
-    bool show_error_popup = false;
-    std::string error_message;
     bool show_picker_for_multiple_instruments = false;
     std::filesystem::path pending_instruments_path;
     std::vector<ym2612::Patch> instruments;
@@ -37,7 +42,23 @@ struct UIState {
     SliderState sustain_level = SliderState::None;
     SliderState sustain_rate = SliderState::None;
     SliderState release_rate = SliderState::None;
+    /// The same six as the graph's handles light them. Kept apart from the
+    /// sliders' own, which are written and read at different points of the
+    /// frame: the graph and the sliders each take the stronger of the two.
+    struct HandleLit {
+      SliderState total_level = SliderState::None;
+      SliderState attack_rate = SliderState::None;
+      SliderState decay_rate = SliderState::None;
+      SliderState sustain_level = SliderState::None;
+      SliderState sustain_rate = SliderState::None;
+      SliderState release_rate = SliderState::None;
+    } handles;
+    /// A handle on the graph is being dragged, which holds the time axis
+    /// still.
+    bool handle_active = false;
   } envelope_states[4];
+
+  ui::OperatorEditState operator_edit;
 
   struct ConfirmationState {
     bool show_unsaved_changes_dialog = false;
@@ -78,6 +99,117 @@ struct UIState {
     }
 
   } confirmation_state;
+
+  struct DangerConfirmationState {
+    bool requested = false;
+    std::string title;
+    std::string message;
+    std::string confirm_label;
+    std::function<void()> on_confirm;
+
+    void request(std::string dialog_title, std::string dialog_message,
+                 std::string button_label,
+                 std::function<void()> confirm_action) {
+      requested = true;
+      title = std::move(dialog_title);
+      message = std::move(dialog_message);
+      confirm_label = std::move(button_label);
+      on_confirm = std::move(confirm_action);
+    }
+
+    void clear() {
+      requested = false;
+      title.clear();
+      message.clear();
+      confirm_label.clear();
+      on_confirm = {};
+    }
+  } danger_confirmation_state;
+
+  struct TextPromptState {
+    bool requested = false;
+    std::string title;
+    std::string label;
+    std::string buffer;
+    std::string confirm_label;
+    std::function<void(const std::string &)> on_confirm;
+    std::function<std::string(const std::string &)> validator;
+
+    void
+    request(std::string dialog_title, std::string input_label,
+            std::string initial_value, std::string button_label,
+            std::function<void(const std::string &)> confirm_action,
+            std::function<std::string(const std::string &)> validate = {}) {
+      requested = true;
+      title = std::move(dialog_title);
+      label = std::move(input_label);
+      buffer = std::move(initial_value);
+      confirm_label = std::move(button_label);
+      on_confirm = std::move(confirm_action);
+      validator = std::move(validate);
+    }
+
+    void clear() {
+      requested = false;
+      title.clear();
+      label.clear();
+      buffer.clear();
+      confirm_label.clear();
+      on_confirm = {};
+      validator = {};
+    }
+  } text_prompt_state;
+
+  /**
+   * The "New Patch" prompt: a name and the format to write it in.
+   *
+   * Its own state rather than TextPromptState's, whose single control is the
+   * text field. The formats are captured when the prompt is requested, from
+   * the one list of writable formats the registry keeps.
+   */
+  struct NewPatchPromptState {
+    bool requested = false;
+    std::filesystem::path folder;
+    std::string name;
+    std::string extension;
+    std::vector<formats::SaveFormatInfo> formats;
+    std::function<void(const std::string &name, const std::string &extension)>
+        on_confirm;
+
+    void request(std::filesystem::path target_folder,
+                 std::vector<formats::SaveFormatInfo> save_formats,
+                 std::function<void(const std::string &, const std::string &)>
+                     confirm_action) {
+      requested = true;
+      folder = std::move(target_folder);
+      name.clear();
+      formats = std::move(save_formats);
+      extension = formats.empty() ? std::string{} : formats.front().extension;
+      on_confirm = std::move(confirm_action);
+    }
+
+    void clear() {
+      requested = false;
+      folder.clear();
+      name.clear();
+      extension.clear();
+      formats.clear();
+      on_confirm = {};
+    }
+  } new_patch_prompt_state;
+
+  /**
+   * The tree's "Duplicate": the copy waits here for the dialog that names it.
+   *
+   * The patch is held rather than reloaded, so the copy is the one that was
+   * clicked however the tree changes meanwhile. Unused where a native save
+   * dialog does the asking.
+   */
+  struct PatchDuplicateState {
+    ui::PatchSaveDialogState dialog;
+    ym2612::Patch patch;
+  } patch_duplicate_state;
+
   ui::SaveExportState save_export_state;
 };
 

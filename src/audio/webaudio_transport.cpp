@@ -1,6 +1,13 @@
 #include "audio/webaudio_transport.hpp"
 #include <algorithm>
+#include <string>
 #include <iostream>
+
+namespace {
+constexpr std::size_t kReservedPeriods = 4;
+constexpr std::size_t kEngineChannels = 2;
+constexpr std::size_t kEngineFrameSize = kEngineChannels * sizeof(std::int16_t);
+} // namespace
 
 WebAudioTransport::WebAudioTransport()
     : audio_stream_(nullptr), owns_audio_subsystem_(false), callback_(),
@@ -29,6 +36,14 @@ bool WebAudioTransport::start(std::uint32_t sample_rate,
     owns_audio_subsystem_ = true;
   }
 
+  // SDL's Emscripten backend doubles whatever it is asked for, so the
+  // request is half the frames the device will end up with. Bigger is safer
+  // here than on desktop: Emscripten runs the audio callback on the main
+  // thread, where it competes with rendering rather than having its own.
+  const int frames = buffer_frames_ > 0 ? buffer_frames_ : kDefaultBufferFrames;
+  SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES,
+              std::to_string(std::max(frames / 2, 64)).c_str());
+
   SDL_AudioSpec desired{};
   desired.freq = static_cast<int>(sample_rate);
   desired.channels = 2;
@@ -48,6 +63,18 @@ bool WebAudioTransport::start(std::uint32_t sample_rate,
 
   frame_size_ = SDL_AUDIO_FRAMESIZE(desired);
   sample_rate_ = sample_rate != 0 ? sample_rate : desired.freq;
+  SDL_AudioSpec device_format{};
+  int sample_frames = 0;
+  if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(audio_stream_),
+                               &device_format, &sample_frames) &&
+      sample_frames > 0) {
+    // Sized rather than reserved, and sized here rather than in the callback,
+    // which runs on the thread the render deadline is measured against.
+    const std::size_t reserved_frames =
+        static_cast<std::size_t>(sample_frames) * kReservedPeriods;
+    temp_buffer_.assign(reserved_frames * frame_size_, 0);
+    int_buffer_.assign(reserved_frames * kEngineChannels, 0);
+  }
 
   if (!SDL_SetAudioStreamGetCallback(audio_stream_, stream_callback, this)) {
     std::cerr << "Failed to set audio stream callback: " << SDL_GetError()
@@ -89,6 +116,7 @@ void WebAudioTransport::stop() {
 
   callback_ = nullptr;
   temp_buffer_.clear();
+  int_buffer_.clear();
   initialized_ = false;
 }
 
@@ -117,40 +145,42 @@ void WebAudioTransport::handle_stream_callback(SDL_AudioStream *stream,
     return;
   }
 
-  const std::size_t samples_requested =
-      static_cast<std::size_t>(required) / sizeof(int16_t);
+  const std::size_t frames_requested =
+      static_cast<std::size_t>(required) / frame_size_;
+  if (frames_requested == 0) {
+    return;
+  }
+  // A device that asks for more than start() sized the buffers for still gets
+  // the audio it asked for; growing here is the exception, not the rule.
+  const std::size_t samples_requested = frames_requested * kEngineChannels;
   if (int_buffer_.size() < samples_requested) {
     int_buffer_.resize(samples_requested);
   }
+  if (temp_buffer_.size() < samples_requested * sizeof(float)) {
+    temp_buffer_.resize(samples_requested * sizeof(float));
+  }
 
-  std::uint32_t produced =
-      callback_(static_cast<std::uint32_t>(samples_requested * sizeof(int16_t)),
+  const std::uint32_t produced =
+      callback_(static_cast<std::uint32_t>(frames_requested * kEngineFrameSize),
                 static_cast<void *>(int_buffer_.data()));
   if (produced == 0) {
     return;
   }
 
-  const std::size_t produced_samples =
-      static_cast<std::size_t>(produced) / sizeof(int16_t);
-  if (produced_samples < 2) {
+  const std::size_t frames = std::min(
+      static_cast<std::size_t>(produced) / kEngineFrameSize, frames_requested);
+  if (frames == 0) {
     return;
   }
 
-  const std::size_t frames = produced_samples / 2;
-  temp_buffer_.resize(frames * sizeof(float) * 2);
+  const std::size_t produced_samples = frames * kEngineChannels;
   float *out = reinterpret_cast<float *>(temp_buffer_.data());
   const int16_t *in = int_buffer_.data();
 
-#if defined(__EMSCRIPTEN__) && defined(__wasm_simd128__)
   for (std::size_t i = 0; i < produced_samples; ++i) {
     out[i] = static_cast<float>(in[i]) / 32768.0f;
   }
-#else
-  for (std::size_t i = 0; i < produced_samples; ++i) {
-    out[i] = static_cast<float>(in[i]) / 32768.0f;
-  }
-#endif
 
   SDL_PutAudioStreamData(stream, temp_buffer_.data(),
-                         static_cast<int>(frames * sizeof(float) * 2));
+                         static_cast<int>(produced_samples * sizeof(float)));
 }

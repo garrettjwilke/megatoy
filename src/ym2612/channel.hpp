@@ -1,10 +1,6 @@
 #pragma once
 #include "note.hpp"
 #include "ym2612/types.hpp"
-#include <emu/EmuCores.h>
-#include <emu/EmuStructs.h>
-#include <emu/SoundDevs.h>
-#include <emu/SoundEmu.h>
 
 namespace ym2612 {
 
@@ -19,7 +15,7 @@ public:
 
   void write_settings(const ChannelSettings &settings);
   void write_instrument(const ChannelInstrument &instrument);
-  void write_frequency(const Note &note);
+  void write_frequency(const Note &note, float bend_semitones = 0.0f);
   void write_key_on(bool op1, bool op2, bool op3, bool op4);
   void write_key_off();
 

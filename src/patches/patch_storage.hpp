@@ -1,6 +1,6 @@
 #pragma once
 
-#include "patch_metadata.hpp"
+#include "patches/folder_metadata.hpp"
 #include "ym2612/patch.hpp"
 #include <filesystem>
 #include <optional>
@@ -48,15 +48,25 @@ public:
   virtual bool load_patch(const PatchEntry &entry,
                           ym2612::Patch &out_patch) const = 0;
 
-  // Attempt to remove the patch referenced by the entry. Default: unsupported.
-  virtual bool remove_patch(const PatchEntry &) { return false; }
-
   // Attempt to save a patch with the provided name. Default: unsupported.
-  virtual SavePatchResult
-  save_patch(const ym2612::Patch &, const std::string &, bool /*overwrite*/,
-             std::string_view /*preferred_extension*/) {
+  virtual SavePatchResult save_patch(const ym2612::Patch &, const std::string &,
+                                     bool /*overwrite*/,
+                                     std::string_view /*preferred_extension*/) {
     return SavePatchResult::unsupported();
   }
+
+  // File deletion is opt-in so read-only and non-filesystem storages refuse it.
+  virtual bool can_delete_patch(const PatchEntry &) const { return false; }
+  virtual bool delete_patch(const PatchEntry &) { return false; }
+
+  // Separate from deleting: a directory can be renamed but not deleted, since
+  // deleting one would take everything inside it.
+  virtual bool can_rename_patch(const PatchEntry &) const { return false; }
+  virtual bool rename_patch(const PatchEntry &, const std::string &) {
+    return false;
+  }
+
+  virtual bool can_edit_metadata(const PatchEntry &) const { return false; }
 
   // Optional metadata operations. Default is unsupported (for storages without
   // metadata persistence).
@@ -85,16 +95,6 @@ public:
   // unsupported, return std::nullopt.
   virtual std::optional<bool> has_patch_named(const std::string &) const {
     return std::nullopt;
-  }
-
-  // Optional download/export hook for storages that cannot map to filesystem
-  // paths (e.g., web download). Returns success/failure.
-  virtual bool download_patch(const ym2612::Patch &,
-                              const std::string &name,
-                              const std::string &extension_hint) {
-    (void)name;
-    (void)extension_hint;
-    return false;
   }
 
   // Optional path mapping helpers so PatchRepository doesn't need platform

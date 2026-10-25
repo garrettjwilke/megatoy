@@ -1,13 +1,25 @@
 #include "operator_editor.hpp"
 #include "envelope_image.hpp"
-#include "formats/common.hpp"
+#include "gui/components/operator_commands.hpp"
 #include "gui/components/preview/ssg_preview.hpp"
+#include "gui/envelope/envelope_handles.hpp"
+#include "gui/styles/megatoy_style.hpp"
+#include "gui/ui_scale.hpp"
 #include "patch_editor.hpp"
+#include "ym2612/operator_edit.hpp"
 #include "ym2612/types.hpp"
+#include <algorithm>
+#include <cmath>
 #include <imgui.h>
+// MarkItemEdited(): an invisible button is not a widget ImGui counts as
+// editable, and the undo step a drag opens is closed on that count.
+#include <imgui_internal.h>
+#include <iterator>
+#include <optional>
 #include <string>
 
 namespace ui {
+
 void text_centered(std::string text, float frame_width) {
   ImGui::Dummy(ImVec2(frame_width, ImGui::GetTextLineHeight()));
 
@@ -31,281 +43,721 @@ update_slider_state(UIState::EnvelopeState::SliderState &slider_state) {
   }
 }
 
-void render_envelope(PatchEditorContext &context, ym2612::OperatorSettings &op,
-                     UIState::EnvelopeState &envelope_state,
-                     std::string op_label, std::string key_prefix) {
+namespace {
 
-  ImGui::BeginGroup(); // ADSR Envelope group
-  render_envelope_image(op, envelope_state, image_size);
+// Room between an operator's border and its contents.
+float frame_padding() { return ui::scale::px(6.0f); }
+// Clearance either side of the header where the top border breaks for it.
+float header_gap() { return ui::scale::px(4.0f); }
 
-  ImGui::BeginGroup();
-  text_centered("TL", vslider_width);
-  ImGui::SameLine();
-  text_centered("AR", vslider_width);
-  ImGui::SameLine();
-  text_centered("DR", vslider_width);
-  ImGui::SameLine();
-  text_centered("SL", vslider_width);
-  ImGui::SameLine();
-  text_centered("SR", vslider_width);
-  ImGui::SameLine();
-  text_centered("RR", vslider_width);
-  ImGui::EndGroup();
-
-  // Attack Rate (0-31)
-  ImGui::BeginGroup();
-
-  // Total Level (0-127)
-  int total_level = op.total_level;
-  bool total_changed =
-      ImGui::VSliderInt("##Total Level", vslider_size, &total_level, 127, 0);
-  update_slider_state(envelope_state.total_level);
-  track_patch_history(context, op_label + " Total Level",
-                      key_prefix + ".total_level");
-  if (total_changed) {
-    op.total_level = static_cast<uint8_t>(total_level);
-  }
-  if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Total Level");
-  }
-
-  ImGui::SameLine();
-
-  int attack_rate = op.attack_rate;
-  bool attack_changed =
-      ImGui::VSliderInt("##Attack Rate", vslider_size, &attack_rate, 31, 0);
-  update_slider_state(envelope_state.attack_rate);
-  track_patch_history(context, op_label + " Attack Rate",
-                      key_prefix + ".attack_rate");
-  if (attack_changed) {
-    op.attack_rate = static_cast<uint8_t>(attack_rate);
-  }
-  if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Attack Rate");
-  }
-  ImGui::SameLine();
-
-  // Decay Rate (0-31)
-  int decay_rate = op.decay_rate;
-  bool decay_changed =
-      ImGui::VSliderInt("##Decay Rate", vslider_size, &decay_rate, 31, 0);
-  update_slider_state(envelope_state.decay_rate);
-  track_patch_history(context, op_label + " Decay Rate",
-                      key_prefix + ".decay_rate");
-  if (decay_changed) {
-    op.decay_rate = static_cast<uint8_t>(decay_rate);
-  }
-  if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Decay Rate");
-  }
-  ImGui::SameLine();
-
-  // Sustain Level (0-15)
-  int sustain_level = op.sustain_level;
-  bool sustain_level_changed =
-      ImGui::VSliderInt("##Sustain Level", vslider_size, &sustain_level, 15, 0);
-  update_slider_state(envelope_state.sustain_level);
-  track_patch_history(context, op_label + " Sustain Level",
-                      key_prefix + ".sustain_level");
-  if (sustain_level_changed) {
-    op.sustain_level = static_cast<uint8_t>(sustain_level);
-  }
-  if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Sustain Level");
-  };
-  ImGui::SameLine();
-
-  // Sustain Rate (0-31)
-  int sustain_rate = op.sustain_rate;
-  bool sustain_rate_changed =
-      ImGui::VSliderInt("##Sustain Rate", vslider_size, &sustain_rate, 31, 0);
-  update_slider_state(envelope_state.sustain_rate);
-  track_patch_history(context, op_label + " Sustain Rate",
-                      key_prefix + ".sustain_rate");
-  if (sustain_rate_changed) {
-    op.sustain_rate = static_cast<uint8_t>(sustain_rate);
-  }
-  if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Sustain Rate");
-  }
-  ImGui::SameLine();
-
-  // Release Rate (0-15)
-  int release_rate = op.release_rate;
-  bool release_changed =
-      ImGui::VSliderInt("##Release Rate", vslider_size, &release_rate, 15, 0);
-  update_slider_state(envelope_state.release_rate);
-  track_patch_history(context, op_label + " Release Rate",
-                      key_prefix + ".release_rate");
-  if (release_changed) {
-    op.release_rate = static_cast<uint8_t>(release_rate);
-  }
-  if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Release Rate");
-  }
-  ImGui::EndGroup();
-
-  ImGui::EndGroup(); // End ADSR Envelope group
+/// The envelope graph and the rate slider row beneath it, as one height.
+float total_level_slider_height() {
+  return envelope_graph_height() + vslider_height() +
+         ImGui::GetStyle().ItemSpacing.y;
 }
 
-// Helper function to render operator settings
-bool render_operator_editor(PatchEditorContext &context, ym2612::Patch &patch,
-                            ym2612::OperatorSettings &op, int op_index,
-                            UIState::EnvelopeState &envelope_state,
-                            bool space_for_feedback) {
-  bool setting_changed = false;
+/// What the TL column costs the graph beside it: one slider and the gap.
+float total_level_column_width() {
+  return vslider_width() + ImGui::GetStyle().ItemSpacing.x;
+}
 
-  const auto column_layout = ImGui::GetContentRegionAvail().x > 410.0f;
+ym2612::MultiEditMode multi_edit_mode(const PatchEditorContext &context) {
+  return context.prefs.multi_operator_edit_absolute
+             ? ym2612::MultiEditMode::Absolute
+             : ym2612::MultiEditMode::Relative;
+}
 
-  ym2612::OperatorIndex op_enum = ym2612::all_operator_indices[op_index];
-  auto is_modulator =
-      static_cast<int>(op_enum) <
-      ym2612::algorithm_modulator_count[patch.instrument.algorithm];
-  std::string op_label = "Operator " + std::to_string(op_index + 1) +
-                         (is_modulator ? "" : " (Carrier)");
-  std::string key_prefix = "instrument.op" + std::to_string(op_index);
-
-  if (!is_modulator) {
-    ImGui::PushStyleColor(ImGuiCol_Text,
-                          ImGui::GetStyleColorVec4(ImGuiCol_FrameBgActive));
-    ImGui::PushStyleColor(ImGuiCol_Separator,
-                          ImGui::GetStyleColorVec4(ImGuiCol_FrameBgActive));
+/// Clicking replaces the selection; shift toggles, so a mis-picked operator
+/// can come back out of what a paste is about to overwrite.
+void note_operator_click(OperatorSelection &selection, int slot) {
+  if (ImGui::GetIO().KeyShift) {
+    selection.toggle_extend(slot);
+  } else {
+    selection.select_only(slot);
   }
-  ImVec2 pos = ImGui::GetCursorPos();
-  ImGui::SeparatorText(op_label.c_str());
-  ImGui::SetCursorPosY(pos.y);
+}
 
-  ImGui::PushID(op_index);
-  bool operator_enable = op.enable;
-  if (ImGui::Checkbox("##Operator Enable", &operator_enable)) {
-    op.enable = operator_enable;
-    setting_changed = true;
+/**
+ * Editing keeps the group and only moves the lead; editing outside the
+ * selection collapses onto it. Shift extends rather than toggles -- a
+ * shift-drag must not drop the operator under the cursor mid-drag.
+ */
+void note_operator_edit(OperatorSelection &selection, int slot) {
+  if (ImGui::GetIO().KeyShift) {
+    selection.extend(slot);
+  } else {
+    selection.touch(slot);
   }
-  track_patch_history(context, op_label + " Enable", key_prefix + ".op_enable");
+}
 
-  if (!is_modulator) {
+/**
+ * Border colour by state. Selected is the lead's highlight faded rather than
+ * a grey, which sat too close to the unselected borders to register. Hover
+ * only shows on unselected operators, where it advertises the click.
+ */
+ImU32 operator_frame_color(bool selected, bool is_primary, bool hovered) {
+  const ImVec4 highlight = styles::color(styles::MegatoyCol::TextHighlight);
+  if (is_primary) {
+    return ImGui::GetColorU32(highlight);
+  }
+  if (selected) {
+    return ImGui::GetColorU32(
+        ImVec4(highlight.x, highlight.y, highlight.z, highlight.w * 0.5f));
+  }
+  if (hovered) {
+    return ImGui::GetColorU32(ImGuiCol_SeparatorHovered);
+  }
+  return ImGui::GetColorU32(ImGuiCol_Border);
+}
+
+/**
+ * The frame, cut open at the corner the header sits across: the top border
+ * resumes past the label, the left border below the checkbox.
+ *
+ * The half-pixel inset is what AddRect does internally; without it the line
+ * falls between two pixels and blurs.
+ */
+void draw_operator_frame(const ImVec2 &min, const ImVec2 &max,
+                         float top_resume_x, float left_resume_y, ImU32 color) {
+  ImDrawList *draw_list = ImGui::GetWindowDrawList();
+  const float left = min.x + 0.5f;
+  const float top = min.y + 0.5f;
+  const float right = max.x - 0.5f;
+  const float bottom = max.y - 0.5f;
+
+  if (top_resume_x < right) {
+    draw_list->AddLine(ImVec2(top_resume_x, top), ImVec2(right, top), color);
+  }
+  if (left_resume_y < bottom) {
+    draw_list->AddLine(ImVec2(left, left_resume_y), ImVec2(left, bottom),
+                       color);
+  }
+  draw_list->AddLine(ImVec2(right, top), ImVec2(right, bottom), color);
+  draw_list->AddLine(ImVec2(left, bottom), ImVec2(right, bottom), color);
+}
+
+struct FieldLabels {
+  const char *name;
+  /// Undo merge key; unchanged from before so drags still merge.
+  const char *key;
+};
+
+FieldLabels field_labels(ym2612::OperatorField field) {
+  switch (field) {
+  case ym2612::OperatorField::TotalLevel:
+    return {"Total Level", "total_level"};
+  case ym2612::OperatorField::AttackRate:
+    return {"Attack Rate", "attack_rate"};
+  case ym2612::OperatorField::DecayRate:
+    return {"Decay Rate", "decay_rate"};
+  case ym2612::OperatorField::SustainLevel:
+    return {"Sustain Level", "sustain_level"};
+  case ym2612::OperatorField::SustainRate:
+    return {"Sustain Rate", "sustain_rate"};
+  case ym2612::OperatorField::ReleaseRate:
+    return {"Release Rate", "release_rate"};
+  case ym2612::OperatorField::KeyScale:
+    return {"Key Scale", "key_scale"};
+  case ym2612::OperatorField::Multiple:
+    return {"Multiple", "multiple"};
+  case ym2612::OperatorField::Detune:
+    return {"Detune", "detune"};
+  case ym2612::OperatorField::SsgType:
+    return {"SSG EG Type", "ssg_type"};
+  }
+  return {"", ""};
+}
+
+std::string history_key(int slot, const char *suffix) {
+  return "instrument.op" + std::to_string(slot) + "." + suffix;
+}
+
+/// "OP1 Total Level", or "OP1, OP3 Total Level" with several selected, so
+/// the Edit menu's "Undo ..." says how far the change reached.
+std::string history_label(const OperatorSelection &selection, int slot,
+                          const char *name) {
+  const std::string who = selection.contains(slot) && selection.count() > 1
+                              ? operator_selection_label(selection)
+                              : operator_slot_label(slot);
+  return who + " " + name;
+}
+
+struct OperatorWidget {
+  PatchEditorContext &editor;
+  ym2612::ChannelInstrument &instrument;
+  int slot;
+};
+
+/**
+ * One operator parameter, with the selection, the relative spreading and the
+ * undo history in a single place rather than repeated per slider.
+ *
+ * `vertical_size` picks a VSliderInt, and those hide their label, so they are
+ * the ones that get a tooltip.
+ */
+void operator_slider(OperatorWidget &widget, ym2612::OperatorField field,
+                     const char *id, const ImVec2 *vertical_size,
+                     const char *value_format,
+                     UIState::EnvelopeState::SliderState *slider_state,
+                     UIState::EnvelopeState::SliderState handle_lit =
+                         UIState::EnvelopeState::SliderState::None) {
+  auto &state = widget.editor.operator_edit;
+  auto &op = ym2612::operator_at(widget.instrument, widget.slot);
+  const auto range = ym2612::operator_field_range(field);
+  const auto labels = field_labels(field);
+
+  // The handle on the graph and the slider set the same register, so pointing
+  // at either shows on both.
+  const bool lit_elsewhere =
+      handle_lit != UIState::EnvelopeState::SliderState::None;
+  if (lit_elsewhere) {
+    ImGui::PushStyleColor(
+        ImGuiCol_FrameBg,
+        ImGui::GetStyleColorVec4(
+            handle_lit == UIState::EnvelopeState::SliderState::Active
+                ? ImGuiCol_FrameBgActive
+                : ImGuiCol_FrameBgHovered));
+  }
+
+  int value = ym2612::read_operator_field(op, field);
+  const bool changed =
+      vertical_size
+          ? ImGui::VSliderInt(id, *vertical_size, &value, range.max, range.min)
+          : ImGui::SliderInt(id, &value, range.min, range.max, value_format);
+  if (lit_elsewhere) {
     ImGui::PopStyleColor();
-    ImGui::PopStyleColor();
   }
+  if (slider_state) {
+    update_slider_state(*slider_state);
+  }
+
+  // Order matters on the frame a drag starts: the selection settles, then
+  // the baseline is captured, and only then is the new value written.
+  if (ImGui::IsItemActivated()) {
+    note_operator_edit(state.selection, widget.slot);
+    ym2612::capture_operator_baseline(state.baseline, widget.instrument, field,
+                                      widget.slot);
+  }
+
+  track_patch_history(widget.editor,
+                      history_label(state.selection, widget.slot, labels.name),
+                      history_key(widget.slot, labels.key));
+
+  if (changed) {
+    ym2612::apply_operator_field_edit(
+        widget.instrument, state.selection.selected, state.baseline, field,
+        widget.slot, value, multi_edit_mode(widget.editor));
+  }
+  if (ImGui::IsItemDeactivated()) {
+    state.baseline.clear();
+  }
+
+  if (vertical_size && ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("%s", labels.name);
+  }
+}
+
+struct HandleSpec {
+  ui::envelope::HandleIndex handle;
+  const char *name;
+  /// Also the button's ID, which lives in the graph's own window and so
+  /// cannot collide with the slider's.
+  const char *key;
+};
+
+/// In the order the parameters they stand for run.
+constexpr HandleSpec kHandleSpecs[] = {
+    {ui::envelope::kAttackHandle, "Attack Peak", "attack_peak"},
+    {ui::envelope::kDecayHandle, "Decay Knee", "decay_knee"},
+    {ui::envelope::kSustainHandle, "Sustain Rate", "sustain_rate"},
+    {ui::envelope::kReleaseHandle, "Release Rate", "release_rate"},
+};
+
+/**
+ * The two parameters a handle stands for: the one it drags along the time
+ * axis and the one it drags up and down. Either may be absent, and both are
+ * one undo entry -- a drag that moves the peak moves TL and AR together.
+ */
+struct HandleAxes {
+  std::optional<ym2612::OperatorField> across;
+  std::optional<ym2612::OperatorField> down;
+};
+
+HandleAxes axes_of(ui::envelope::HandleIndex handle) {
+  const ui::envelope::HandleFields fields = ui::envelope::handle_fields(handle);
+  HandleAxes axes;
+  if (fields.across) {
+    axes.across = ui::envelope::field_of(*fields.across);
+  }
+  if (fields.down) {
+    axes.down = ui::envelope::field_of(*fields.down);
+  }
+  return axes;
+}
+
+/// What a drag remembers between frames. ImGui has one active item, so there
+/// is one of these however many graphs are on screen.
+struct HandleDrag {
+  ImGuiID id = 0;
+  ImVec2 grab_mouse;
+  /// The handle and the plot it stood on, as they were when it was grabbed.
+  ui::envelope::HandleGrab grab;
+  ym2612::OperatorEditBaseline across;
+  ym2612::OperatorEditBaseline down;
+};
+
+HandleDrag &handle_drag() {
+  static HandleDrag drag;
+  return drag;
+}
+
+/// Where a field lights up on the graph, or nullptr for one the graph says
+/// nothing about.
+UIState::EnvelopeState::SliderState *
+slider_state_for(UIState::EnvelopeState::HandleLit &states,
+                 ym2612::OperatorField field) {
+  switch (field) {
+  case ym2612::OperatorField::TotalLevel:
+    return &states.total_level;
+  case ym2612::OperatorField::AttackRate:
+    return &states.attack_rate;
+  case ym2612::OperatorField::DecayRate:
+    return &states.decay_rate;
+  case ym2612::OperatorField::SustainLevel:
+    return &states.sustain_level;
+  case ym2612::OperatorField::SustainRate:
+    return &states.sustain_rate;
+  case ym2612::OperatorField::ReleaseRate:
+    return &states.release_rate;
+  default:
+    return nullptr;
+  }
+}
+
+/// One field of a drag, written the way a slider writes it: spread across the
+/// selection from the baseline taken on the grab.
+void write_handle_value(OperatorWidget &widget, ym2612::OperatorField field,
+                        const ym2612::OperatorEditBaseline &baseline,
+                        int value) {
+  auto &state = widget.editor.operator_edit;
+  const auto &op = ym2612::operator_at(widget.instrument, widget.slot);
+  if (value == ym2612::read_operator_field(op, field)) {
+    return;
+  }
+  ym2612::apply_operator_field_edit(widget.instrument, state.selection.selected,
+                                    baseline, field, widget.slot, value,
+                                    multi_edit_mode(widget.editor));
+  ImGui::MarkItemEdited(ImGui::GetItemID());
+}
+
+/// Whether a handle was put on the graph at all, and how it is to be lit.
+struct HandleTouch {
+  bool placed = false;
+  UIState::EnvelopeState::SliderState lit =
+      UIState::EnvelopeState::SliderState::None;
+};
+
+/**
+ * One handle: the invisible button on it, the drag measured from where it was
+ * grabbed, and the same write path a slider takes -- so a drag spreads across
+ * the selection and comes back in one undo step like any other edit.
+ */
+HandleTouch operator_handle(OperatorWidget &widget,
+                            const ui::envelope::EnvelopeHandles &handles,
+                            const HandleSpec &spec,
+                            ui::envelope::HandleIndex nearest,
+                            UIState::EnvelopeState::HandleLit &handle_states) {
+  const ui::envelope::EnvelopeHandle &item = handles.items[spec.handle];
+  const ImGuiID id = ImGui::GetID(spec.key);
+  // A handle whose own rule has stopped showing it keeps its button while it
+  // is the one being dragged: the drag is the pointer's until it is let go.
+  const bool held = ImGui::GetActiveID() == id;
+  if (!item.shown && !held) {
+    return {};
+  }
+  // Only the handle the pointer is nearest gets a button, so two that share a
+  // grab box do not decide it between them by the order they are offered in.
+  if (!held && spec.handle != nearest) {
+    HandleTouch idle;
+    idle.placed = true;
+    return idle;
+  }
+
+  auto &state = widget.editor.operator_edit;
+  HandleDrag &drag = handle_drag();
+  const HandleAxes axes = axes_of(spec.handle);
+  const ui::envelope::PlotArea &plot = handles.plot;
+  const float grab = handles.metrics.grab;
+  // The box stays inside the plot: half of one hanging over the edge is half
+  // a box that cannot be clicked, and it would leave the graph's own window
+  // with something to scroll.
+  const ImVec2 corner(std::min(std::max(item.pos.x - grab, plot.min.x),
+                               plot.max.x - grab * 2.0f),
+                      std::min(std::max(item.pos.y - grab, plot.min.y),
+                               plot.max.y - grab * 2.0f));
+  ImGui::SetCursorScreenPos(corner);
+  ImGui::InvisibleButton(spec.key, ImVec2(grab * 2.0f, grab * 2.0f));
+
+  // The order a slider keeps on the frame a drag starts: the selection
+  // settles, then the baselines, and only then is anything written.
+  if (ImGui::IsItemActivated()) {
+    note_operator_edit(state.selection, widget.slot);
+    drag = HandleDrag{};
+    drag.id = id;
+    drag.grab_mouse = ImGui::GetIO().MousePos;
+    drag.grab = ui::envelope::grab_handle(handles, spec.handle);
+    if (axes.across) {
+      ym2612::capture_operator_baseline(drag.across, widget.instrument,
+                                        *axes.across, widget.slot);
+    }
+    if (axes.down) {
+      ym2612::capture_operator_baseline(drag.down, widget.instrument,
+                                        *axes.down, widget.slot);
+    }
+  }
+
+  track_patch_history(widget.editor,
+                      history_label(state.selection, widget.slot, spec.name),
+                      history_key(widget.slot, spec.key));
+
+  if (ImGui::IsItemActive() && drag.id == id) {
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    // Measured from the grab, so a pointer that has not moved asks for the
+    // value the handle is already at -- and nothing is written for it.
+    const ui::envelope::Point moved{mouse.x - drag.grab_mouse.x,
+                                    mouse.y - drag.grab_mouse.y};
+    const ui::envelope::HandleEdit edit = ui::envelope::drag_handle(
+        drag.grab,
+        ui::envelope::to_operator_params(
+            ym2612::operator_at(widget.instrument, widget.slot)),
+        ui::envelope::reference_pitch(), moved);
+    // In the order they were answered in: a knee's level settles before the
+    // rate that is measured to it.
+    for (int i = 0; i < edit.count; ++i) {
+      const ym2612::OperatorField field =
+          ui::envelope::field_of(edit.writes[i].field);
+      const ym2612::OperatorEditBaseline *baseline = nullptr;
+      if (axes.across && field == *axes.across) {
+        baseline = &drag.across;
+      } else if (axes.down && field == *axes.down) {
+        baseline = &drag.down;
+      }
+      if (baseline == nullptr) {
+        continue;
+      }
+      write_handle_value(widget, field, *baseline, edit.writes[i].value);
+    }
+  }
+  if (ImGui::IsItemDeactivated()) {
+    drag = HandleDrag{};
+  }
+
+  HandleTouch touch;
+  touch.placed = true;
+  update_slider_state(touch.lit);
+  // Both of a handle's parameters light up together: they are the two halves
+  // of the one point being pointed at.
+  for (const auto &field : {axes.across, axes.down}) {
+    if (!field) {
+      continue;
+    }
+    if (auto *lit = slider_state_for(handle_states, *field)) {
+      if (static_cast<int>(touch.lit) > static_cast<int>(*lit)) {
+        *lit = touch.lit;
+      }
+    }
+  }
+  return touch;
+}
+
+/// The handles on one graph. Returns whether one of them is being dragged,
+/// which is what holds the time axis still.
+bool render_envelope_handles(OperatorWidget &widget,
+                             const ui::envelope::EnvelopeHandles &handles,
+                             UIState::EnvelopeState::HandleLit &handle_states) {
+  constexpr size_t count = std::size(kHandleSpecs);
+  const ui::envelope::HandleIndex nearest = ui::envelope::nearest_handle(
+      handles, ui::envelope::to_point(ImGui::GetIO().MousePos));
+  HandleTouch touched[count];
+  for (size_t i = 0; i < count; ++i) {
+    touched[i] = operator_handle(widget, handles, kHandleSpecs[i], nearest,
+                                 handle_states);
+  }
+
+  bool active = false;
+  // Back to front, so two that stand close together are drawn in the order
+  // the parameters run rather than the other way about.
+  for (size_t i = count; i-- > 0;) {
+    if (!touched[i].placed) {
+      continue;
+    }
+    active |= touched[i].lit == UIState::EnvelopeState::SliderState::Active;
+    draw_envelope_handle(handles, kHandleSpecs[i].handle, touched[i].lit);
+  }
+  return active;
+}
+
+/**
+ * A per-operator flag. Booleans have no delta, so spreading one is absolute
+ * in both modes. `spread` is off for the enable flag: it is a mute, and
+ * dragging the others along would undo the audition it was set up for.
+ */
+void operator_checkbox(OperatorWidget &widget, const char *id, const char *name,
+                       bool ym2612::OperatorSettings::*flag, bool spread) {
+  auto &state = widget.editor.operator_edit;
+  auto &op = ym2612::operator_at(widget.instrument, widget.slot);
+
+  bool value = op.*flag;
+  const bool changed = ImGui::Checkbox(id, &value);
+  if (ImGui::IsItemActivated()) {
+    note_operator_edit(state.selection, widget.slot);
+  }
+  if (changed) {
+    track_instant_patch_history(
+        widget.editor, history_label(state.selection, widget.slot, name), [&] {
+          if (spread) {
+            ym2612::apply_operator_flag_edit(
+                widget.instrument, state.selection.selected, flag, value);
+          } else {
+            op.*flag = value;
+          }
+        });
+  }
+}
+
+/// The operator's enable checkbox and name, sitting in the frame's top
+/// border. Returns the x where the border can pick up again.
+float render_operator_header(OperatorWidget &widget, uint8_t algorithm,
+                             const ImVec2 &header_min) {
+  const int slot = widget.slot;
+  // Carriers reach the output; modulators only feed other operators. Which
+  // is which moves with the algorithm, so it is worth saying on every one.
+  const bool is_modulator = ym2612::operator_register_index(slot) <
+                            ym2612::algorithm_modulator_count[algorithm];
+
+  ImGui::SetCursorScreenPos(header_min);
+  ImGui::BeginGroup();
+  operator_checkbox(widget, "##Operator Enable", "Enable",
+                    &ym2612::OperatorSettings::enable, false);
+  ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+  if (is_modulator) {
+    ImGui::TextUnformatted(operator_slot_label(slot).c_str());
+  } else {
+    ImGui::TextColored(ImGui::GetStyleColorVec4(ImGuiCol_FrameBgActive),
+                       "%s (Carrier)", operator_slot_label(slot).c_str());
+  }
+  ImGui::EndGroup();
+  return ImGui::GetItemRectMax().x;
+}
+
+/**
+ * TL's own column, the label above a slider as tall as the envelope graph and
+ * the rate slider row together.
+ *
+ * TL runs 0..127 where the rate sliders run 0..31 and 0..15, so it takes both
+ * rows' height for one step to stay wider than a pixel under the mouse. It
+ * sits beside the graph rather than under it because the graph's vertical
+ * axis is attenuation and TL is the operator's output level: the two read as
+ * one axis.
+ */
+void render_total_level_slider(OperatorWidget &widget,
+                               UIState::EnvelopeState &envelope_state) {
+  const ImVec2 slider_size(vslider_width(), total_level_slider_height());
+
+  ImGui::BeginGroup();
+  text_centered("TL", slider_size.x);
+  operator_slider(widget, ym2612::OperatorField::TotalLevel, "##Total Level",
+                  &slider_size, nullptr, &envelope_state.total_level,
+                  envelope_state.handles.total_level);
+  ImGui::EndGroup();
+}
+
+/**
+ * The five rate sliders under the graph, labelled.
+ *
+ * Five 20 px columns and the gaps between them, which together with the TL
+ * column beside them comes to hslider_width(). The graph above is wider than
+ * this in the two-column layout, and the sliders deliberately do not follow
+ * it -- widening them would claim they share the graph's axis, and a 20 px
+ * column is the width these are grabbed at.
+ */
+void render_envelope_sliders(OperatorWidget &widget,
+                             UIState::EnvelopeState &envelope_state) {
+  const ImVec2 slider_size = vslider_size();
+  const float label_width = slider_size.x;
+
+  ImGui::BeginGroup(); // ADSR slider block
+
+  ImGui::BeginGroup();
+  text_centered("AR", label_width);
+  ImGui::SameLine();
+  text_centered("DR", label_width);
+  ImGui::SameLine();
+  text_centered("SL", label_width);
+  ImGui::SameLine();
+  text_centered("SR", label_width);
+  ImGui::SameLine();
+  text_centered("RR", label_width);
+  ImGui::EndGroup();
+
+  ImGui::BeginGroup();
+  operator_slider(widget, ym2612::OperatorField::AttackRate, "##Attack Rate",
+                  &slider_size, nullptr, &envelope_state.attack_rate,
+                  envelope_state.handles.attack_rate);
+  ImGui::SameLine();
+  operator_slider(widget, ym2612::OperatorField::DecayRate, "##Decay Rate",
+                  &slider_size, nullptr, &envelope_state.decay_rate,
+                  envelope_state.handles.decay_rate);
+  ImGui::SameLine();
+  operator_slider(widget, ym2612::OperatorField::SustainLevel,
+                  "##Sustain Level", &slider_size, nullptr,
+                  &envelope_state.sustain_level,
+                  envelope_state.handles.sustain_level);
+  ImGui::SameLine();
+  operator_slider(widget, ym2612::OperatorField::SustainRate, "##Sustain Rate",
+                  &slider_size, nullptr, &envelope_state.sustain_rate,
+                  envelope_state.handles.sustain_rate);
+  ImGui::SameLine();
+  operator_slider(widget, ym2612::OperatorField::ReleaseRate, "##Release Rate",
+                  &slider_size, nullptr, &envelope_state.release_rate,
+                  envelope_state.handles.release_rate);
+  ImGui::EndGroup();
+
+  ImGui::EndGroup(); // End ADSR slider block
+}
+
+void render_operator_contents(PatchEditorContext &context, ym2612::Patch &patch,
+                              int slot, UIState::EnvelopeState &envelope_state,
+                              bool space_for_feedback,
+                              const EnvelopeVoices &voices) {
+  auto &state = context.operator_edit;
+  auto &instrument = patch.instrument;
+  auto &op = ym2612::operator_at(instrument, slot);
+  OperatorWidget widget{context, instrument, slot};
+
+  // Two columns only when the right-hand one fits whole. Its widest row is a
+  // full-width slider plus its label, and the gap between the columns is the
+  // SameLine/Spacing/SameLine below.
+  const ImGuiStyle &style = ImGui::GetStyle();
+  const float content_width = ImGui::GetContentRegionAvail().x;
+  const float side_column_width = hslider_width() + style.ItemInnerSpacing.x +
+                                  ImGui::CalcTextSize("SSG EG Type").x;
+  const float two_column_width =
+      hslider_width() + style.ItemSpacing.x * 2.0f + side_column_width;
+  const bool column_layout = content_width > two_column_width;
 
   if (!op.enable) {
     ImGui::BeginDisabled();
   }
-  ImGui::PushItemWidth(hslider_width);
+  ImGui::PushItemWidth(hslider_width());
 
-  if (op_index == 0) {
-    // Feedback (0-7)
-    int feedback = patch.instrument.feedback;
-    bool feedback_changed = ImGui::SliderInt("Feedback", &feedback, 0, 7);
-    track_patch_history(context, "Operator 1 Feedback", "instrument.feedback");
+  if (slot == 0) {
+    // Feedback belongs to the channel, not to an operator -- there is one of
+    // it, and OP1's panel is only where it is drawn. So it spreads nowhere,
+    // but it still leads: editing it makes OP1 the primary operator.
+    int feedback = instrument.feedback;
+    const bool feedback_changed = ImGui::SliderInt("Feedback", &feedback, 0, 7);
+    if (ImGui::IsItemActivated()) {
+      note_operator_edit(state.selection, 0);
+    }
+    track_patch_history(context, "OP1 Feedback", "instrument.feedback");
     if (feedback_changed) {
-      patch.instrument.feedback = static_cast<uint8_t>(feedback);
-      setting_changed = true;
+      instrument.feedback = static_cast<uint8_t>(feedback);
     }
   } else if (space_for_feedback) {
-    ImVec2 pos = ImGui::GetCursorPos();
-    ImGui::SetCursorPosY(pos.y + 20);
+    // Stand in for the Feedback slider OP1 has and the others do not, so all
+    // four line up.
+    ImVec2 feedback_gap = ImGui::GetCursorPos();
+    ImGui::SetCursorPosY(feedback_gap.y + ImGui::GetFrameHeightWithSpacing());
   }
 
-  // Amplitude Modulation Enable
-  bool amplitude_mod = op.amplitude_modulation_enable;
-  if (ImGui::Checkbox("Amplitude Modulation Enable", &amplitude_mod)) {
-    op.amplitude_modulation_enable = amplitude_mod;
-    setting_changed = true;
-  }
-  track_patch_history(context, op_label + " Amplitude Modulation",
-                      key_prefix + ".am_enable");
+  operator_checkbox(
+      widget, "Amplitude Modulation Enable", "Amplitude Modulation",
+      &ym2612::OperatorSettings::amplitude_modulation_enable, true);
   ImGui::Spacing();
 
-  render_envelope(context, op, envelope_state, op_label, key_prefix);
+  // TL runs down the left of the panel in every layout; the graph and the rate
+  // sliders start to the right of it.
+  const float block_left = ImGui::GetCursorPosX();
+  render_total_level_slider(widget, envelope_state);
+  ImGui::SameLine();
+
+  // The graph is what the panel is read for, so it spans what the TL column
+  // leaves in every layout, with the rate sliders underneath. frame_padding()
+  // comes off the right so it clears the border by as much as the contents do
+  // on the left. Only the pixels change: the time axis is unaffected.
+  ImGui::BeginGroup();
+  const ui::envelope::EnvelopeHandles handles = render_envelope_image(
+      op, envelope_state,
+      ImVec2(content_width - frame_padding() - total_level_column_width(),
+             envelope_graph_height()),
+      voices);
+  // Inside the graph's own window, which render_envelope_image leaves open:
+  // an item anywhere else could not be hovered over the graph.
+  envelope_state.handles = UIState::EnvelopeState::HandleLit{};
+  envelope_state.handle_active =
+      render_envelope_handles(widget, handles, envelope_state.handles);
+  end_envelope_image();
+  const float sliders_top = ImGui::GetCursorPosY();
+  render_envelope_sliders(widget, envelope_state);
+  ImGui::EndGroup();
 
   if (column_layout) {
-    ImGui::SameLine();
-    ImGui::Spacing();
-    ImGui::SameLine();
+    // Placed against the slider block, not the group just closed -- that
+    // group is as wide as the graph, so SameLine() off it would land past
+    // the panel's right edge. Level with the vertical sliders rather than
+    // with the graph, so the SSG controls sit straight above Key Scale.
+    ImGui::SetCursorPos(
+        ImVec2(block_left + hslider_width() + ImGui::GetStyle().ItemSpacing.x * 2,
+               sliders_top));
     ImGui::BeginGroup();
   } else {
     ImGui::Spacing();
   }
 
-  // SSG Enable
-  //
   // SSG Type Envelope Control (0-7)
-  int ssg_type = op.ssg_type_envelope_control;
+  const int ssg_type = op.ssg_type_envelope_control;
   if (const auto *preview = op.ssg_enable ? get_ssg_preview_texture(ssg_type)
                                           : get_ssg_preview_off_texture()) {
     if (preview->valid()) {
-      ImGui::Image(preview->texture_id, preview->size);
+      ImGui::Image(preview->texture_id, ui::scale::px(preview->size));
     }
   }
   ImGui::SameLine();
 
-  bool ssg_enable = op.ssg_enable;
-  if (ImGui::Checkbox("SSG EG Enable", &ssg_enable)) {
-    op.ssg_enable = ssg_enable;
-    setting_changed = true;
-  }
-  track_patch_history(context, op_label + " SSG EG Enable",
-                      key_prefix + ".ssg_enable");
+  operator_checkbox(widget, "SSG EG Enable", "SSG EG Enable",
+                    &ym2612::OperatorSettings::ssg_enable, true);
 
+  const bool ssg_enable = op.ssg_enable;
   if (!ssg_enable) {
     ImGui::BeginDisabled();
   }
-
-  bool ssg_type_changed = ImGui::SliderInt("SSG EG Type", &ssg_type, 0, 7);
-  track_patch_history(context, op_label + " SSG EG Type",
-                      key_prefix + ".ssg_type");
-  if (ssg_type_changed) {
-    op.ssg_type_envelope_control = static_cast<uint8_t>(ssg_type);
-    setting_changed = true;
-  }
+  operator_slider(widget, ym2612::OperatorField::SsgType, "SSG EG Type",
+                  nullptr, nullptr, nullptr);
   if (!ssg_enable) {
     ImGui::EndDisabled();
   }
 
-  if (column_layout) {
-    ImVec2 pos = ImGui::GetCursorPos();
-    ImGui::SetCursorPosY(pos.y + 123);
-  } else {
+  // Only the single-column layout needs a break here: in the two-column one
+  // the SSG controls already stand clear of the sliders beside them.
+  if (!column_layout) {
     ImGui::Spacing();
   }
 
-  // Key Scale (0-3)
-  int key_scale = op.key_scale;
-  bool key_scale_changed = ImGui::SliderInt("Key Scale", &key_scale, 0, 3);
-  track_patch_history(context, op_label + " Key Scale",
-                      key_prefix + ".key_scale");
-  if (key_scale_changed) {
-    op.key_scale = static_cast<uint8_t>(key_scale);
-    setting_changed = true;
-  }
+  operator_slider(widget, ym2612::OperatorField::KeyScale, "Key Scale", nullptr,
+                  nullptr, nullptr);
 
-  // Multiple (0-15)
-  const char *multiple_labels[] = {"0.5", "1",  "2",  "3", "4",  "5",
-                                   "6",   "7",  "8",  "9", "10", "11",
-                                   "12",  "13", "14", "15"};
-  int multiple = op.multiple;
-  bool multiple_changed =
-      ImGui::SliderInt("Multiple", &multiple, 0, 15, multiple_labels[multiple]);
-  track_patch_history(context, op_label + " Multiple",
-                      key_prefix + ".multiple");
-  if (multiple_changed) {
-    op.multiple = static_cast<uint8_t>(multiple);
-    setting_changed = true;
-  }
+  static const char *multiple_labels[] = {"0.5", "1",  "2",  "3", "4",  "5",
+                                          "6",   "7",  "8",  "9", "10", "11",
+                                          "12",  "13", "14", "15"};
+  operator_slider(widget, ym2612::OperatorField::Multiple, "Multiple", nullptr,
+                  multiple_labels[op.multiple], nullptr);
 
-  // Detune (0-7)
-  const char *detune_labels[] = {
-      "-3", "-2", "-1", "0", "1", "2", "3",
-  };
-  int detune = formats::detune_from_patch_to_dmp(op.detune);
-  bool detune_changed =
-      ImGui::SliderInt("Detune", &detune, 0, 6, detune_labels[detune]);
-  track_patch_history(context, op_label + " Detune", key_prefix + ".detune");
-  if (detune_changed) {
-    op.detune = static_cast<uint8_t>(formats::detune_from_dmp_to_patch(detune));
-    setting_changed = true;
-  }
+  static const char *detune_labels[] = {"-3", "-2", "-1", "0", "1", "2", "3"};
+  operator_slider(widget, ym2612::OperatorField::Detune, "Detune", nullptr,
+                  detune_labels[ym2612::read_operator_field(
+                      op, ym2612::OperatorField::Detune)],
+                  nullptr);
 
   if (column_layout) {
     ImGui::EndGroup();
@@ -315,9 +767,104 @@ bool render_operator_editor(PatchEditorContext &context, ym2612::Patch &patch,
   if (!op.enable) {
     ImGui::EndDisabled();
   }
+}
+
+} // namespace
+
+void render_operator_editor(PatchEditorContext &context, ym2612::Patch &patch,
+                            int slot, UIState::EnvelopeState &envelope_state,
+                            bool space_for_feedback,
+                            const EnvelopeVoices &voices) {
+  auto &state = context.operator_edit;
+  OperatorWidget widget{context, patch.instrument, slot};
+
+  ImGui::PushID(slot);
+
+  const ImVec2 block_min = ImGui::GetCursorScreenPos();
+  // Not GetColumnWidth(): a column clips its draw list tighter than that,
+  // and the right border falls outside.
+  const float frame_width = std::max(ImGui::GetContentRegionAvail().x, 1.0f);
+
+  // The header straddles the top border, aligned with the sliders in the
+  // sections above rather than indented into the frame.
+  const float header_height = ImGui::GetFrameHeight();
+  const ImVec2 frame_min(block_min.x, block_min.y + header_height * 0.5f);
+  const float header_end =
+      render_operator_header(widget, patch.instrument.algorithm, block_min);
+  const float top_resume_x =
+      std::min(header_end + header_gap(), frame_min.x + frame_width);
+  const float left_resume_y = block_min.y + header_height + header_gap();
+
+  ImGui::SetCursorScreenPos(
+      ImVec2(frame_min.x + frame_padding(),
+             block_min.y + header_height + frame_padding()));
+  ImGui::BeginGroup();
+  render_operator_contents(context, patch, slot, envelope_state,
+                           space_for_feedback, voices);
+  ImGui::EndGroup();
+
+  const float content_height =
+      ImGui::GetItemRectMax().y - frame_min.y + frame_padding();
+  state.pending_frame_height =
+      std::max(state.pending_frame_height, content_height);
+  // All four drawn to the tallest one's height so the borders line up. From
+  // the previous frame; measuring and applying in one would need two passes.
+  const float frame_height = std::max(content_height, state.frame_height);
+  const ImVec2 frame_max(frame_min.x + frame_width, frame_min.y + frame_height);
+  // Claim the full block so the columns row and the scroll extent account
+  // for the header, the padding and any borrowed height.
+  ImGui::SetCursorScreenPos(ImVec2(block_min.x, frame_max.y));
+
+  // By rectangle rather than an invisible button underneath, which would
+  // have to yield hover to every widget on top of it -- IsAnyItemHovered
+  // reports that directly.
+  const bool window_hovered =
+      ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
+  // From block_min: the header sits above the border, and clicking beside
+  // the label should select too.
+  const bool frame_hovered =
+      window_hovered && ImGui::IsMouseHoveringRect(block_min, frame_max);
+  const bool on_background = frame_hovered && !ImGui::IsAnyItemHovered();
+  // Not while something is being dragged, so a slider drag that wanders out
+  // does not light up the operator it passes over.
+  const bool background_hovered = on_background && !ImGui::IsAnyItemActive();
+
+  if (on_background && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+    note_operator_click(state.selection, slot);
+    state.click_claimed = true;
+  }
+
+  // Anywhere in the frame, including on a slider, which ignores right-click.
+  if (frame_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+    if (!state.selection.contains(slot)) {
+      state.selection.select_only(slot);
+    }
+    state.click_claimed = true;
+    ImGui::OpenPopup("##operator_menu");
+  }
+  if (ImGui::BeginPopup("##operator_menu")) {
+    OperatorCommandContext commands{
+        patch.instrument, state,
+        [&context](const std::string &label) {
+          if (context.begin_history) {
+            context.begin_history(label, {}, context.session.current_patch());
+          }
+        },
+        [&context]() {
+          if (context.commit_history) {
+            context.commit_history();
+          }
+        }};
+    render_operator_command_items(commands);
+    ImGui::EndPopup();
+  }
+
+  draw_operator_frame(frame_min, frame_max, top_resume_x, left_resume_y,
+                      operator_frame_color(state.selection.contains(slot),
+                                           state.selection.primary == slot,
+                                           background_hovered));
 
   ImGui::PopID();
-  return setting_changed;
 }
 
 } // namespace ui

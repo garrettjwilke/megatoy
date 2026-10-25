@@ -1,71 +1,110 @@
 #include "patches/filesystem_patch_storage.hpp"
 
-#include "formats/ctrmml.hpp"
-#include "formats/gin.hpp"
 #include "formats/ginpkg.hpp"
 #include "formats/patch_loader.hpp"
 #include "formats/patch_registry.hpp"
-#include "patch_metadata.hpp"
+#include "formats/ym2612_format_adapter.hpp"
 #include "patch_repository.hpp"
 #include "patches/filename_utils.hpp"
+#include "patches/patch_write.hpp"
+#include "patches/persistent_parse_cache.hpp"
+#include "platform/import_pipeline.hpp"
 #include <algorithm>
 #include <cctype>
+#include <system_error>
 #include <unordered_map>
-
-namespace {
-
-std::vector<std::string> supported_extensions() {
-  return {".gin", ".ginpkg", ".rym2612", ".dmp", ".fui", ".mml"};
-}
-
-} // namespace
 
 namespace patches {
 
 FilesystemPatchStorage::FilesystemPatchStorage(
     platform::VirtualFileSystem &vfs, std::filesystem::path root,
-    std::string relative_root_label, PatchMetadataManager *metadata_manager,
-    bool writable, std::optional<std::filesystem::path> write_root)
+    std::string relative_root_label, bool writable, bool enable_metadata,
+    PersistentParseCache *persistent_cache)
     : vfs_(vfs), root_(std::move(root)),
-      root_label_(std::move(relative_root_label)),
-      metadata_manager_(metadata_manager), writable_(writable),
-      write_root_(std::move(write_root)) {
-  if (root_label_.empty()) {
+      root_label_(std::move(relative_root_label)), writable_(writable),
+      label_(root_label_), persistent_cache_(persistent_cache) {
+  if (label_.empty()) {
     label_ = root_.filename().generic_string();
-  } else {
-    label_ = root_label_;
+    root_label_ = label_;
   }
+  if (enable_metadata) {
+    metadata_ = std::make_unique<FolderMetadataStore>(root_ / ".megatoy" /
+                                                      "patches.json");
+    metadata_->load();
+  }
+}
+
+std::string
+FilesystemPatchStorage::metadata_key(const std::string &relative_path) const {
+  const std::string prefix = root_label_ + "/";
+  if (relative_path.rfind(prefix, 0) == 0) {
+    return relative_path.substr(prefix.size());
+  }
+  return relative_path;
+}
+
+bool FilesystemPatchStorage::owns_relative_path(
+    const std::string &relative_path) const {
+  return relative_path == root_label_ ||
+         relative_path.rfind(root_label_ + "/", 0) == 0;
+}
+
+void FilesystemPatchStorage::set_scan_observer(ScanObserver observer) {
+  scan_observer_ = std::move(observer);
 }
 
 void FilesystemPatchStorage::append_entries(
     std::vector<PatchEntry> &tree) const {
-  if (!vfs_.is_directory(root_)) {
-    return;
-  }
+  seen_container_paths_.clear();
+  scan_aborted_ = false;
 
-  std::vector<PatchEntry> children;
-  scan_directory(root_, children, root_label_);
-  if (children.empty()) {
-    return;
-  }
+  PatchEntry root_entry;
+  root_entry.name = label_;
+  root_entry.relative_path = root_label_;
+  root_entry.full_path = root_;
+  root_entry.is_directory = true;
 
-  if (!root_label_.empty()) {
-    PatchEntry root_entry;
-    root_entry.name = root_label_;
-    root_entry.relative_path = root_label_;
-    root_entry.full_path = root_;
-    root_entry.is_directory = true;
-    root_entry.children = std::move(children);
-    tree.push_back(std::move(root_entry));
-  } else {
-    tree.insert(tree.end(), children.begin(), children.end());
+  // An added folder is listed even when it is empty or missing, so the user
+  // can see it is part of the workspace and remove it again.
+  if (vfs_.is_directory(root_)) {
+    root_entry.holds_nothing =
+        scan_directory(root_, root_entry.children, root_label_);
   }
+  // An aborted walk never reached the rest of the tree, so its record of what
+  // is still on disk is not one to evict from.
+  for (auto it = parse_cache_.begin();
+       !scan_aborted_ && it != parse_cache_.end();) {
+    if (!seen_container_paths_.contains(it->first)) {
+      it = parse_cache_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  tree.push_back(std::move(root_entry));
 }
 
 bool FilesystemPatchStorage::load_patch(const PatchEntry &entry,
                                         ym2612::Patch &out_patch) const {
-  if (entry.is_directory) {
+  if (entry.is_directory || !owns_relative_path(entry.relative_path)) {
     return false;
+  }
+  if (!entry.container_item_id.empty() &&
+      lowercase_extension(entry.full_path) == ".ginpkg") {
+    if (entry.container_item_id == "__current__") {
+      auto patches = formats::ginpkg::read_file(entry.full_path);
+      if (patches.size() == 1) {
+        out_patch = std::move(patches.front());
+        return true;
+      }
+      return false;
+    }
+    auto patch =
+        formats::ginpkg::read_version(entry.full_path, entry.container_item_id);
+    if (!patch) {
+      return false;
+    }
+    out_patch = std::move(*patch);
+    return true;
   }
   auto result = formats::load_patch_from_file(entry.full_path);
   if (result.status == formats::PatchLoadStatus::Failure) {
@@ -74,7 +113,7 @@ bool FilesystemPatchStorage::load_patch(const PatchEntry &entry,
     out_patch = result.patches[0];
     return true;
   }
-  size_t instrument_index = entry.ctrmml_index;
+  size_t instrument_index = entry.instrument_index;
   if (instrument_index < result.patches.size()) {
     out_patch = result.patches[instrument_index];
     return true;
@@ -90,18 +129,34 @@ FilesystemPatchStorage::save_patch(const ym2612::Patch &patch,
     return SavePatchResult::unsupported();
   }
 
-  const auto patches_dir = write_root_.value_or(root_);
+  const auto patches_dir = root_;
   const auto sanitized = sanitize_filename(name.empty() ? "patch" : name);
+  auto patch_to_write = patch;
+  patch_to_write.name = sanitized;
 
   const auto ginpkg_path =
       formats::ginpkg::build_package_path(patches_dir, sanitized);
-  const auto gin_path = formats::gin::build_patch_path(patches_dir, sanitized);
+  const auto gin_path = patches_dir / (sanitized + ".gin");
 
   std::string pref_ext(preferred_extension);
-  std::transform(pref_ext.begin(), pref_ext.end(), pref_ext.begin(),
-                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  std::transform(
+      pref_ext.begin(), pref_ext.end(), pref_ext.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   const bool prefer_ginpkg = pref_ext == ".ginpkg";
   const bool prefer_gin = pref_ext == ".gin";
+
+  if (!pref_ext.empty() && !prefer_ginpkg && !prefer_gin) {
+    if (pref_ext.front() != '.') {
+      pref_ext.insert(pref_ext.begin(), '.');
+    }
+    const auto target = patches_dir / (sanitized + pref_ext);
+    if (!overwrite && vfs_.exists(target)) {
+      return SavePatchResult::duplicate();
+    }
+    return patches::write_patch(patch_to_write, target)
+               ? SavePatchResult::success(target)
+               : SavePatchResult::error("Failed to save patch");
+  }
 
   const bool ginpkg_exists = vfs_.exists(ginpkg_path);
   const bool gin_exists = vfs_.exists(gin_path);
@@ -111,7 +166,7 @@ FilesystemPatchStorage::save_patch(const ym2612::Patch &patch,
       return SavePatchResult::duplicate();
     }
     if (auto path = formats::PatchRegistry::instance().save_package(
-            ".ginpkg", patches_dir, sanitized, patch)) {
+            ".ginpkg", patches_dir, sanitized, patch_to_write)) {
       return SavePatchResult::success(*path);
     }
     return SavePatchResult::error("Failed to save patch");
@@ -121,9 +176,9 @@ FilesystemPatchStorage::save_patch(const ym2612::Patch &patch,
     if (gin_exists && !overwrite) {
       return SavePatchResult::duplicate();
     }
-    auto gin_result = formats::gin::save_patch(patches_dir, patch, sanitized);
-    if (gin_result.has_value()) {
-      return SavePatchResult::success(gin_result.value());
+    if (auto path = formats::PatchRegistry::instance().save_package(
+            ".gin", patches_dir, sanitized, patch_to_write)) {
+      return SavePatchResult::success(*path);
     }
     return SavePatchResult::error("Failed to save patch");
   };
@@ -152,52 +207,153 @@ FilesystemPatchStorage::save_patch(const ym2612::Patch &patch,
     return save_ginpkg();
   }
 
-  // Default to ginpkg, fall back to gin on failure.
-  auto ginpkg_result = save_ginpkg();
-  if (ginpkg_result.status == SavePatchResult::Status::Success) {
-    return ginpkg_result;
+  // GIN is the normal one-patch save format. GINPKG remains available for
+  // explicit versioned packages and as a compatibility fallback.
+  auto gin_result = save_gin();
+  if (gin_result.status == SavePatchResult::Status::Success) {
+    return gin_result;
   }
-  return save_gin();
+  return save_ginpkg();
+}
+
+bool FilesystemPatchStorage::can_rename_patch(const PatchEntry &entry) const {
+  if (!writable_ || !owns_relative_path(entry.relative_path) ||
+      !entry.source_relative_path.empty() || !entry.container_item_id.empty() ||
+      entry.full_path.empty()) {
+    return false;
+  }
+
+  const auto mapped = to_absolute_path(entry.relative_path);
+  return mapped &&
+         mapped->lexically_normal() == entry.full_path.lexically_normal();
+}
+
+bool FilesystemPatchStorage::can_delete_patch(const PatchEntry &entry) const {
+  // A directory can be renamed but not deleted: deleting one would take
+  // everything inside it.
+  return can_rename_patch(entry) && !vfs_.is_directory(entry.full_path);
+}
+
+bool FilesystemPatchStorage::delete_patch(const PatchEntry &entry) {
+  if (!can_delete_patch(entry)) {
+    return false;
+  }
+
+  std::error_code ec;
+  if (!std::filesystem::remove(entry.full_path, ec) || ec) {
+    return false;
+  }
+  if (metadata_) {
+    metadata_->remove(metadata_key(entry.relative_path));
+  }
+  return true;
+}
+
+bool FilesystemPatchStorage::rename_patch(const PatchEntry &entry,
+                                          const std::string &new_stem) {
+  if (!can_rename_patch(entry) || new_stem.empty() ||
+      sanitize_filename(new_stem) != new_stem) {
+    return false;
+  }
+
+  // A directory's name is its whole name; only a file has an extension to
+  // keep. "drums.old" is a folder called that, not one called "drums".
+  const bool is_directory = vfs_.is_directory(entry.full_path);
+  const auto target =
+      entry.full_path.parent_path() /
+      (is_directory ? new_stem
+                    : new_stem + entry.full_path.extension().string());
+  if (target == entry.full_path) {
+    return true;
+  }
+
+  std::error_code ec;
+  if (std::filesystem::exists(target, ec)) {
+    if (ec || !std::filesystem::equivalent(entry.full_path, target, ec) || ec) {
+      return false;
+    }
+  } else if (ec) {
+    return false;
+  }
+
+  std::filesystem::rename(entry.full_path, target, ec);
+  if (ec) {
+    return false;
+  }
+
+  // The sidecar lives inside the storage root with keys relative to it, so
+  // renaming the root moves the file and leaves every key correct. Anything
+  // below the root needs its keys re-prefixed.
+  const bool is_storage_root = entry.relative_path == root_label_;
+  if (metadata_ && !is_storage_root) {
+    const auto relative = std::filesystem::path(entry.relative_path);
+    const auto renamed_relative = relative.parent_path() / target.filename();
+    if (!metadata_->rename_key_prefix(
+            metadata_key(entry.relative_path),
+            metadata_key(renamed_relative.generic_string()))) {
+      std::error_code rollback_error;
+      std::filesystem::rename(target, entry.full_path, rollback_error);
+      return false;
+    }
+  }
+  return true;
+}
+
+bool FilesystemPatchStorage::can_edit_metadata(const PatchEntry &entry) const {
+  return metadata_ && owns_relative_path(entry.relative_path);
 }
 
 bool FilesystemPatchStorage::save_patch_metadata(
     const std::string &relative_path, const ym2612::Patch &patch,
     const PatchMetadata &metadata) {
-  if (!metadata_manager_) {
+  if (!metadata_ || !owns_relative_path(relative_path)) {
     return false;
   }
 
-  PatchMetadata metadata_with_hash = metadata;
-  metadata_with_hash.path = relative_path;
-  metadata_with_hash.hash = patch.hash();
-
-  return metadata_manager_->save_metadata(metadata_with_hash);
+  PatchMetadata stored = metadata;
+  stored.path = metadata_key(relative_path);
+  stored.hash = patch.hash();
+  return metadata_->put(std::move(stored));
 }
 
 bool FilesystemPatchStorage::update_patch_metadata(
     const std::string &relative_path, const PatchMetadata &metadata) {
-  if (!metadata_manager_) {
+  if (!metadata_ || !owns_relative_path(relative_path)) {
     return false;
   }
-  PatchMetadata updated_metadata = metadata;
-  updated_metadata.path = relative_path;
-  return metadata_manager_->update_metadata(updated_metadata);
+
+  const auto key = metadata_key(relative_path);
+  PatchMetadata stored = metadata;
+  stored.path = key;
+  // Keep the recorded hash: this path only edits ratings and categories, and
+  // the caller has no patch to hash.
+  if (auto existing = metadata_->get(key)) {
+    stored.hash = existing->hash;
+  }
+  return metadata_->put(std::move(stored));
 }
 
 std::optional<PatchMetadata> FilesystemPatchStorage::get_patch_metadata(
     const std::string &relative_path) const {
-  if (!metadata_manager_) {
+  if (!metadata_ || !owns_relative_path(relative_path)) {
     return std::nullopt;
   }
-  return metadata_manager_->get_metadata(relative_path);
+  return metadata_->get(metadata_key(relative_path));
 }
 
 void FilesystemPatchStorage::cleanup_metadata(
     const std::vector<std::string> &paths) const {
-  if (!metadata_manager_) {
+  if (!metadata_) {
     return;
   }
-  metadata_manager_->cleanup_missing_files(paths);
+  std::vector<std::string> mine;
+  mine.reserve(paths.size());
+  for (const auto &path : paths) {
+    if (owns_relative_path(path)) {
+      mine.push_back(metadata_key(path));
+    }
+  }
+  metadata_->retain_only(mine);
 }
 
 std::optional<bool>
@@ -206,9 +362,10 @@ FilesystemPatchStorage::has_patch_named(const std::string &name) const {
     return std::nullopt;
   }
   auto sanitized = sanitize_filename(name.empty() ? "patch" : name);
-  const auto patches_dir = write_root_.value_or(root_);
-  auto ginpkg_target = formats::ginpkg::build_package_path(patches_dir, sanitized);
-  auto gin_target = formats::gin::build_patch_path(patches_dir, sanitized);
+  const auto patches_dir = root_;
+  auto ginpkg_target =
+      formats::ginpkg::build_package_path(patches_dir, sanitized);
+  auto gin_target = patches_dir / (sanitized + ".gin");
   return vfs_.exists(ginpkg_target) || vfs_.exists(gin_target);
 }
 
@@ -246,14 +403,18 @@ std::optional<std::filesystem::path> FilesystemPatchStorage::to_absolute_path(
   return std::nullopt;
 }
 
-void FilesystemPatchStorage::scan_directory(
+bool FilesystemPatchStorage::scan_directory(
     const std::filesystem::path &dir_path, std::vector<PatchEntry> &tree,
     const std::string &relative_path) const {
   if (!vfs_.is_directory(dir_path)) {
-    return;
+    return false;
   }
 
   auto entries = vfs_.read_directory(dir_path);
+  const bool holds_nothing =
+      std::all_of(entries.begin(), entries.end(), [](const auto &entry) {
+        return entry.path.filename().string().starts_with(".");
+      });
   std::sort(entries.begin(), entries.end(), [](const auto &a, const auto &b) {
     const std::string filename_a = a.path.filename().string();
     const std::string filename_b = b.path.filename().string();
@@ -288,46 +449,173 @@ void FilesystemPatchStorage::scan_directory(
     if (entry.is_directory) {
       info.is_directory = true;
       info.format = "";
-      scan_directory(path, info.children, info.relative_path);
-      if (!info.children.empty()) {
+      info.holds_nothing =
+          scan_directory(path, info.children, info.relative_path);
+      // An empty folder is kept so a new one can be seen; one holding only
+      // files megatoy does not read is not.
+      if (!info.children.empty() || info.holds_nothing) {
         tree.push_back(std::move(info));
       }
+      if (scan_aborted_) {
+        return false;
+      }
     } else if (entry.is_regular_file) {
+      if (scan_observer_.on_file && !scan_observer_.on_file(path)) {
+        scan_aborted_ = true;
+        return false;
+      }
+
       std::string extension = path.extension().string();
       std::transform(extension.begin(), extension.end(), extension.begin(),
                      ::tolower);
 
-      if (extension == ".mml") {
-        std::vector<ym2612::Patch> instruments =
-            formats::ctrmml::read_file(path);
-        if (!instruments.empty()) {
-          PatchEntry container;
-          container.name = path.stem().string();
-          container.full_path = path;
-          container.relative_path = info.relative_path;
-          container.is_directory = true;
-          container.format = "ctrmml";
-
-          for (size_t idx = 0; idx < instruments.size(); ++idx) {
-            const auto &instrument = instruments[idx];
-            PatchEntry child;
-            child.name = instrument.name;
-            child.full_path = path;
-            std::string identifier = instrument.name;
-            std::replace(identifier.begin(), identifier.end(), '/', '_');
-            std::replace(identifier.begin(), identifier.end(), '\\', '_');
-            child.relative_path = container.relative_path + "/" +
-                                  std::to_string(idx) + "_" + identifier;
-            child.format = "ctrmml";
-            child.is_directory = false;
-            child.children.clear();
-            child.ctrmml_index = idx;
-
-            load_metadata_for_entry(child);
-            container.children.push_back(std::move(child));
+      const auto format = formats::adapter::format_for_extension(extension);
+      const bool is_ginpkg = extension == ".ginpkg";
+      const bool is_multi_patch =
+          format && formats::adapter::is_multi_patch(*format);
+      if (is_ginpkg || is_multi_patch) {
+        auto cache_path = path.lexically_normal();
+        if (!cache_path.is_absolute()) {
+          std::error_code ec;
+          const auto absolute = std::filesystem::absolute(cache_path, ec);
+          if (!ec) {
+            cache_path = absolute.lexically_normal();
           }
+        }
+        seen_container_paths_.insert(cache_path);
 
+        std::uintmax_t file_size = 0;
+        std::filesystem::file_time_type modified{};
+        const bool has_identity = vfs_.file_size(path, file_size) &&
+                                  vfs_.last_write_time(path, modified);
+        const auto cached = parse_cache_.find(cache_path);
+        if (has_identity && cached != parse_cache_.end() &&
+            cached->second.file_size == file_size &&
+            cached->second.modified == modified) {
+          auto container = cached->second.subtree;
+          load_metadata_for_subtree(container);
           tree.push_back(std::move(container));
+          continue;
+        }
+        if (cached != parse_cache_.end()) {
+          parse_cache_.erase(cached);
+        }
+
+        auto warmed =
+            platform::import_pipeline::take_warmed_container(cache_path);
+        if (!warmed && has_identity && persistent_cache_) {
+          auto persistent = persistent_cache_->lookup(cache_path, file_size,
+                                                      modified, root_label_);
+          if (persistent) {
+            parse_cache_.insert_or_assign(
+                cache_path, ParseCacheEntry{file_size, modified, *persistent});
+            load_metadata_for_subtree(*persistent);
+            tree.push_back(std::move(*persistent));
+            continue;
+          }
+        }
+        if (!warmed) {
+          ++container_parse_count_;
+        }
+        std::optional<PatchEntry> parsed_container;
+        if (is_ginpkg) {
+          auto package = warmed && warmed->package
+                             ? warmed->package
+                             : formats::ginpkg::load_package(path);
+          auto current =
+              package ? formats::ginpkg::read_current(*package) : std::nullopt;
+          if (package && current) {
+            PatchEntry container;
+            container.name = path.stem().string();
+            container.full_path = path;
+            container.relative_path = info.relative_path;
+            container.is_directory = true;
+            container.format = "ginpkg";
+
+            PatchEntry latest;
+            latest.name =
+                current->name.empty() ? "Latest" : current->name + " (Latest)";
+            latest.full_path = path;
+            latest.relative_path = container.relative_path + "/latest";
+            latest.source_relative_path = container.relative_path;
+            latest.container_item_id = "__current__";
+            latest.format = "ginpkg";
+            latest.is_directory = false;
+            container.children.push_back(std::move(latest));
+
+            for (auto it = package->history().rbegin();
+                 it != package->history().rend(); ++it) {
+              PatchEntry version;
+              auto snapshot = formats::ginpkg::read_version(*package, it->uuid);
+              version.name = it->comment && !it->comment->empty()
+                                 ? *it->comment
+                                 : it->timestamp;
+              if (snapshot && !snapshot->name.empty()) {
+                version.name += " — " + snapshot->name;
+              }
+              version.full_path = path;
+              version.relative_path =
+                  container.relative_path + "/version_" + it->uuid;
+              version.source_relative_path = container.relative_path;
+              version.container_item_id = it->uuid;
+              version.format = "ginpkg";
+              version.is_directory = false;
+              container.children.push_back(std::move(version));
+            }
+            parsed_container = std::move(container);
+          }
+        } else {
+          std::vector<ym2612::Patch> instruments =
+              warmed && !warmed->instruments.empty()
+                  ? warmed->instruments
+                  : formats::adapter::read_file(*format, path);
+          if (!instruments.empty()) {
+            const std::string format_name =
+                ym2612_format::format_to_extension(*format);
+
+            PatchEntry container;
+            container.name = path.stem().string();
+            container.full_path = path;
+            container.relative_path = info.relative_path;
+            container.is_directory = true;
+            container.format = format_name;
+
+            for (size_t idx = 0; idx < instruments.size(); ++idx) {
+              const auto &instrument = instruments[idx];
+              PatchEntry child;
+              child.name =
+                  instrument.name.empty()
+                      ? path.stem().string() + " " + std::to_string(idx)
+                      : instrument.name;
+              child.full_path = path;
+              std::string identifier = child.name;
+              std::replace(identifier.begin(), identifier.end(), '/', '_');
+              std::replace(identifier.begin(), identifier.end(), '\\', '_');
+              child.relative_path = container.relative_path + "/" +
+                                    std::to_string(idx) + "_" + identifier;
+              child.source_relative_path = container.relative_path;
+              child.format = format_name;
+              child.is_directory = false;
+              child.instrument_index = idx;
+              container.children.push_back(std::move(child));
+            }
+
+            parsed_container = std::move(container);
+          }
+        }
+
+        if (parsed_container) {
+          if (has_identity) {
+            parse_cache_.insert_or_assign(
+                cache_path,
+                ParseCacheEntry{file_size, modified, *parsed_container});
+            if (persistent_cache_) {
+              persistent_cache_->store(cache_path, file_size, modified,
+                                       root_label_, *parsed_container);
+            }
+          }
+          load_metadata_for_subtree(*parsed_container);
+          tree.push_back(std::move(*parsed_container));
         }
         continue;
       }
@@ -338,12 +626,13 @@ void FilesystemPatchStorage::scan_directory(
 
       info.is_directory = false;
       info.format = detect_format(path);
-      info.name = formats::get_patch_name_from_file(path, info.format);
+      info.name = path.stem().string();
 
       load_metadata_for_entry(info);
       tree.push_back(std::move(info));
     }
   }
+  return holds_nothing;
 }
 
 std::string
@@ -352,13 +641,20 @@ FilesystemPatchStorage::detect_format(const std::filesystem::path &file_path) {
   std::transform(extension.begin(), extension.end(), extension.begin(),
                  ::tolower);
 
-  static const std::unordered_map<std::string, std::string> format_map = {
-      {".gin", "gin"}, {".ginpkg", "ginpkg"}, {".rym2612", "rym2612"},
-      {".dmp", "dmp"}, {".fui", "fui"},       {".mml", "ctrmml"},
-  };
-
-  auto it = format_map.find(extension);
-  return it != format_map.end() ? it->second : "unknown";
+  // Derived from the format library rather than a local table, so a format
+  // added there is labelled here without another edit. A stale copy of this
+  // table is how .tfi files ended up listed as "unknown".
+  if (extension == ".ginpkg") {
+    return "ginpkg";
+  }
+  if (const auto format = formats::adapter::format_for_extension(extension)) {
+    // Historical display name; the extension alone would read as just "mml".
+    if (*format == ym2612_format::Format::Mml) {
+      return "ctrmml";
+    }
+    return extension.substr(1);
+  }
+  return "unknown";
 }
 
 bool FilesystemPatchStorage::is_supported_file(
@@ -367,16 +663,28 @@ bool FilesystemPatchStorage::is_supported_file(
   std::transform(extension.begin(), extension.end(), extension.begin(),
                  ::tolower);
 
-  auto supported = supported_extensions();
+  const auto &supported = platform::import_pipeline::supported_extensions();
   return std::find(supported.begin(), supported.end(), extension) !=
          supported.end();
 }
 
 void FilesystemPatchStorage::load_metadata_for_entry(PatchEntry &entry) const {
-  if (!metadata_manager_ || entry.is_directory) {
+  if (!metadata_ || entry.is_directory) {
     return;
   }
-  entry.metadata = metadata_manager_->get_metadata(entry.relative_path);
+  entry.metadata = metadata_->get(metadata_key(entry.relative_path));
+}
+
+void FilesystemPatchStorage::load_metadata_for_subtree(
+    PatchEntry &entry) const {
+  if (entry.is_directory) {
+    for (auto &child : entry.children) {
+      load_metadata_for_subtree(child);
+    }
+    return;
+  }
+  entry.metadata.reset();
+  load_metadata_for_entry(entry);
 }
 
 } // namespace patches

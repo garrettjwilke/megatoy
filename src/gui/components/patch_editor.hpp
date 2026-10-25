@@ -15,6 +15,7 @@ struct PatchEditorContext {
   patches::PatchSession &session;
   PreferenceManager::UIPreferences &prefs;
   UIState::EnvelopeState (&envelope_states)[4];
+  OperatorEditState &operator_edit;
   std::function<void(const std::string &label, const std::string &merge_key,
                      const ym2612::Patch &before)>
       begin_history;
@@ -28,6 +29,27 @@ inline void track_patch_history(PatchEditorContext &context, const char *label,
   track_patch_history(context, std::string(label),
                       (merge_key && merge_key[0]) ? std::string(merge_key)
                                                   : std::string(label));
+}
+
+/**
+ * Record one undo step around a change that begins and ends in the same
+ * frame, taking the two snapshots either side of the write.
+ *
+ * track_patch_history() opens on activation and closes on deactivation,
+ * which fits a drag but not a checkbox: that writes on the frame it is
+ * released, so the closing snapshot would come before the write. No merge
+ * key here, so two toggles are two steps.
+ */
+template <typename Apply>
+void track_instant_patch_history(PatchEditorContext &context,
+                                 const std::string &label, Apply &&apply) {
+  if (context.begin_history) {
+    context.begin_history(label, {}, context.session.current_patch());
+  }
+  apply();
+  if (context.commit_history) {
+    context.commit_history();
+  }
 }
 
 // Function to render the instrument settings panel

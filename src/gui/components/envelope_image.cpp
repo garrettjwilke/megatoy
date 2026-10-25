@@ -1,179 +1,644 @@
 #include "envelope_image.hpp"
+
 #include "app_state.hpp"
 #include "common.hpp"
+#include "gui/envelope/envelope_curve.hpp"
+#include "gui/envelope/envelope_handles.hpp"
+#include "gui/ui_scale.hpp"
+#include "ym2612/note.hpp"
+
+#include <array>
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdio>
 #include <imgui.h>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+/**
+ * The envelope graph: the held envelope (attack, decay, sustain, key never
+ * released) as a line, the release from full volume at x = 0 as a translucent
+ * filled area, and each sounding voice as a faint curve plus a thin vertical
+ * cursor at where it has got to. The shapes, the milliseconds across and the
+ * attenuation down all come from ym2612_eg by way of gui/envelope; this file
+ * only turns them into pixels. Where the drag handles go is decided there
+ * too: all that happens here is that they are drawn.
+ */
 
 namespace ui {
-ImVec2 operator+(const ImVec2 &lhs, const ImVec2 &rhs) {
-  return ImVec2(lhs.x + rhs.x, lhs.y + rhs.y);
+namespace {
+
+using ui::envelope::EnvelopeCurve;
+using ui::envelope::EnvelopeCurveCache;
+using ui::envelope::kFullScale;
+using ui::envelope::PlotArea;
+using ui::envelope::to_imvec;
+using ui::envelope::to_point;
+using ui::envelope::TraceVertex;
+using ui::envelope::VoiceCurveCache;
+
+/// The wash under the release.
+constexpr float kFillAlpha = 0.30f;
+/// A handle is a hint until it is wanted: dimmer than the line it sits on
+/// until the pointer is on it, when it takes the stretch's own colour.
+constexpr float kHandleIdleAlpha = 0.55f;
+/// The warning line is a footnote, not an alert.
+constexpr float kWarningAlpha = 0.6f;
+
+/// How a sounding voice is drawn: the ghost curve well below the reference
+/// curve's weight, the cursor well above it, each older voice in a chord
+/// fainter than the last, and a finished voice fading out.
+constexpr float kVoiceCurveAlpha = 0.30f;
+constexpr float kVoiceCursorAlpha = 0.85f;
+constexpr float kVoiceRecencyFalloff = 0.65f;
+/// Below this a voice is not worth the draw calls.
+constexpr float kVoiceMinAlpha = 0.02f;
+
+/// How many voice curves the whole editor may simulate in one frame. Building
+/// one is expensive enough that four at once would stutter, so they queue: a
+/// voice without a curve yet is not drawn, and arrives a frame or two later.
+constexpr int kVoiceBuildsPerFrame = 1;
+
+/// The budget above, refilled once per ImGui frame and shared by all four
+/// operators.
+int &voice_build_budget() {
+  static int frame = -1;
+  static int budget = 0;
+  const int now = ImGui::GetFrameCount();
+  if (now != frame) {
+    frame = now;
+    budget = kVoiceBuildsPerFrame;
+  }
+  return budget;
 }
 
-ImVec2 operator-(const ImVec2 &lhs, const ImVec2 &rhs) {
-  return ImVec2(lhs.x - rhs.x, lhs.y - rhs.y);
+/// The colour each stretch of the curve is drawn in, indexed by the phase
+/// that owns it.
+using PhaseColors = std::array<ImU32, 4>;
+
+ImU32 phase_color(const PhaseColors &colors, ym2612_eg::EgPhase phase) {
+  return colors[static_cast<size_t>(phase)];
 }
 
-int compute_effective_rate_attack(int attack_rate, int rate_key_scaling = 0) {
-  return 2 * attack_rate + rate_key_scaling; // 0 ~ 62
+/// Time constant, in seconds, of the axis' exponential approach to a new width.
+constexpr float kAxisTimeConstantSec = 0.12f;
+
+/// Everything one operator's graph remembers between frames: the curve, and
+/// the width the axis was last drawn at. operator_editor pushes the slot onto
+/// the ID stack, so the map never holds more than four entries.
+struct EnvelopeSlot {
+  EnvelopeCurveCache curve;
+  /// The curves of whatever is sounding, keyed on key-scale value rather than
+  /// on the note; see VoiceCurveCache.
+  VoiceCurveCache voices;
+  /// 0 until this operator has been drawn once; the first frame then starts at
+  /// its target instead of growing into it from nothing.
+  double drawn_span_ms = 0.0;
+  /// The voices this operator has already watched fade out. A released voice
+  /// only ever gets quieter, so one that has gone is never drawn again. Six
+  /// voices can sound, so six sequence numbers are enough.
+  std::array<uint64_t, VoiceCurveCache::kMaxEntries> finished{};
+};
+
+bool already_finished(const EnvelopeSlot &slot, uint64_t sequence) {
+  return sequence != 0 &&
+         std::find(slot.finished.begin(), slot.finished.end(), sequence) !=
+             slot.finished.end();
 }
-int compute_effective_rate_decay(int decay_rate, int rate_key_scaling = 0) {
-  return decay_rate + rate_key_scaling; // 0 ~ 31
+
+void remember_finished(EnvelopeSlot &slot, uint64_t sequence) {
+  if (sequence == 0) {
+    return;
+  }
+  // Sequences only grow, so the smallest entry is the one furthest in the past
+  // and the safest to forget.
+  *std::min_element(slot.finished.begin(), slot.finished.end()) = sequence;
 }
-int compute_effective_rate_release(int release_rate, int rate_key_scaling = 0) {
-  return 2 * release_rate + 1 + rate_key_scaling; // 0 ~ 31
+
+/// True while one of this operator's envelope sliders is being dragged.
+bool envelope_slider_active(const UIState::EnvelopeState &state) {
+  using Slider = UIState::EnvelopeState::SliderState;
+  return state.total_level == Slider::Active ||
+         state.attack_rate == Slider::Active ||
+         state.decay_rate == Slider::Active ||
+         state.sustain_level == Slider::Active ||
+         state.sustain_rate == Slider::Active ||
+         state.release_rate == Slider::Active;
 }
+
+EnvelopeSlot &slot_for(ImGuiID id) {
+  static std::unordered_map<ImGuiID, EnvelopeSlot> slots;
+  return slots[id];
+}
+
+/// One frame of the axis' approach to `target_ms`. `snap_ms` is a pixel's
+/// worth of width: below that the remaining motion cannot be seen.
+double approach_span(double current_ms, double target_ms, float dt_sec,
+                     double snap_ms) {
+  if (!(current_ms > 0.0)) {
+    return target_ms; // first frame: start where we are going
+  }
+  if (std::fabs(target_ms - current_ms) <= snap_ms || !(dt_sec > 0.0f)) {
+    return target_ms;
+  }
+  // Exponential in real time, so the motion is the same whatever the frame
+  // rate, and a stalled frame lands most of the way there.
+  const double alpha =
+      1.0 - std::exp(-static_cast<double>(dt_sec) / kAxisTimeConstantSec);
+  return current_ms + (target_ms - current_ms) * alpha;
+}
+
+/// Hovering a slider and dragging it light the same stretch the same way.
 ImU32 color_from_slider_state(
     const UIState::EnvelopeState::SliderState &state) {
-  switch (state) {
-  case UIState::EnvelopeState::SliderState::None:
-    return ImGui::GetColorU32(ImGuiCol_Text);
-  case UIState::EnvelopeState::SliderState::Hover:
-    return ImGui::GetColorU32(ImGuiCol_FrameBgActive);
-  case UIState::EnvelopeState::SliderState::Active:
-    return ImGui::GetColorU32(ImGuiCol_FrameBgActive);
-  }
-  // Default case to prevent warning
-  return ImGui::GetColorU32(ImGuiCol_FrameBg);
+  return state == UIState::EnvelopeState::SliderState::None
+             ? ImGui::GetColorU32(ImGuiCol_Text)
+             : ImGui::GetColorU32(ImGuiCol_FrameBgActive);
 }
 
-void render_envelope_image(const ym2612::OperatorSettings &op,
-                           const UIState::EnvelopeState &state, ImVec2 size) {
-  ImGui::BeginChild("EnvelopeImage", size, false, ImGuiWindowFlags_NoScrollbar);
+void format_ms(char (&out)[16], double ms) {
+  std::snprintf(out, sizeof(out), "%dms", static_cast<int>(ms + 0.5));
+}
+
+/// The one subdued colour for every caption along the top strip.
+ImU32 axis_label_color() {
+  return color_with_alpha(ImGui::GetColorU32(ImGuiCol_Text), kWarningAlpha);
+}
+
+/**
+ * The time grid, labelled every nth line -- n being however many it takes for
+ * the widest label to fit between two of them, so the labels stay evenly
+ * spaced. Every line is drawn. `label_limit_x` is where the text has to stop:
+ * the right edge of the plot, less whatever the note label there has claimed.
+ */
+void draw_time_grid(ImDrawList *draw_list, const PlotArea &plot,
+                    float label_baseline, float label_limit_x) {
+  const ImU32 grid_color = ImGui::GetColorU32(ImGuiCol_Separator);
+  const ImU32 label_color = axis_label_color();
+  // The width being drawn, not the one being animated towards: the lines have
+  // to cover what is actually on screen.
+  const double drawn_ms = std::max(plot.span_ms, 1.0);
+  const double step = ui::envelope::grid_step_ms(drawn_ms);
+  const int lines = static_cast<int>(drawn_ms / step + 1e-6);
+
+  char widest[16];
+  format_ms(widest, step * static_cast<int>(drawn_ms / step + 1e-6));
+  const float needed = ImGui::CalcTextSize(widest).x + ui::scale::px(6.0f);
+  const float pitch = plot.width() * static_cast<float>(step / drawn_ms);
+  const int label_every =
+      std::max(1, static_cast<int>(std::ceil(needed / std::max(pitch, 1.0f))));
+
+  for (int i = 0; i <= lines; ++i) {
+    const double ms = step * i;
+    const float x = plot.x_of(ms);
+    draw_list->AddLine(ImVec2(x, plot.min.y), ImVec2(x, plot.max.y),
+                       grid_color);
+    if (i % label_every != 0) {
+      continue;
+    }
+    char label[16];
+    format_ms(label, ms);
+    if (x + ImGui::CalcTextSize(label).x > label_limit_x) {
+      continue; // would hang off the right edge, or run into the note
+    }
+    draw_list->AddText(ImVec2(x, label_baseline), label_color, label);
+  }
+
+  // Full volume, half attenuation, silence.
+  for (int i = 0; i <= 2; ++i) {
+    const float y = plot.y_of(kFullScale * 0.5 * i);
+    draw_list->AddLine(ImVec2(plot.min.x, y), ImVec2(plot.max.x, y),
+                       grid_color);
+  }
+}
+
+/// A trace as ym2612_eg cuts it to the axis, and the same vertices in pixels.
+struct TracePath {
+  std::vector<TraceVertex> vertices;
+  std::vector<ImVec2> pixels;
+};
+
+/// The scratch the paths are built into. One graph is drawn at a time, so a
+/// single buffer serves every drawer and allocates once for the process.
+TracePath &trace_scratch() {
+  static TracePath path;
+  return path;
+}
+
+void to_pixels(TracePath &path, const PlotArea &plot) {
+  path.pixels.clear();
+  path.pixels.reserve(path.vertices.size());
+  for (const TraceVertex &vertex : path.vertices) {
+    path.pixels.push_back(to_imvec(plot.at(vertex.ms, vertex.out)));
+  }
+}
+
+/// The path as one line, in one colour.
+void stroke_path(ImDrawList *draw_list, TracePath &path, const PlotArea &plot,
+                 ImU32 color) {
+  if (path.vertices.size() < 2) {
+    return;
+  }
+  to_pixels(path, plot);
+  draw_list->AddPolyline(path.pixels.data(),
+                         static_cast<int>(path.pixels.size()), color,
+                         ImDrawFlags_None, ui::scale::px(1.0f));
+}
+
+/**
+ * The release: a translucent area from x = 0 down to the floor, since what it
+ * answers is a property of RR and the SSG-EG key-off rules alone. The fill is
+ * one quad per polyline edge rather than a polygon, because an SSG-EG release
+ * is not convex and AddConvexPolyFilled would fold it inside out;
+ * anti-aliased fill is off for the run so the quads meet without seams.
+ */
+void draw_release_area(ImDrawList *draw_list, const EnvelopeCurve &curve,
+                       const PlotArea &plot, ImU32 color) {
+  const auto &points = curve.release.points;
+  if (points.size() < 2) {
+    return;
+  }
+  TracePath &path = trace_scratch();
+  ui::envelope::build_trace_path(path.vertices, curve.release,
+                                 curve.release_tail_slope, plot.span_ms);
+  to_pixels(path, plot);
+  const ImU32 fill = color_with_alpha(color, kFillAlpha);
+  const ImDrawListFlags saved_flags = draw_list->Flags;
+  draw_list->Flags &= ~ImDrawListFlags_AntiAliasedFill;
+  const size_t edges = path.pixels.size() < 2 ? 0 : path.pixels.size() - 1;
+  for (size_t i = 0; i < edges; ++i) {
+    const ImVec2 &a = path.pixels[i];
+    const ImVec2 &b = path.pixels[i + 1];
+    if (b.x <= a.x) {
+      continue;
+    }
+    draw_list->AddQuadFilled(a, b, ImVec2(b.x, plot.max.y),
+                             ImVec2(a.x, plot.max.y), fill);
+  }
+  draw_list->Flags = saved_flags;
+}
+
+/// The held envelope: a line, no fill, with the key never released. Each edge
+/// is coloured by the parameter that owns the instant it starts at; the tail
+/// past the last simulated point belongs to whatever was happening there.
+void draw_held_line(ImDrawList *draw_list, const EnvelopeCurve &curve,
+                    const PlotArea &plot, const PhaseColors &colors) {
+  if (curve.held.points.empty()) {
+    return;
+  }
+  TracePath &path = trace_scratch();
+  ui::envelope::build_trace_path(path.vertices, curve.held,
+                                 curve.held_tail_slope, plot.span_ms);
+  to_pixels(path, plot);
+  const float thickness = ui::scale::px(1.0f);
+  // One polyline per stretch of one colour, three at most however many
+  // thousand vertices an SSG trace carries.
+  const ui::envelope::PhaseRuns runs =
+      ui::envelope::held_phase_runs(curve, path.vertices);
+  for (int i = 0; i < runs.count; ++i) {
+    const ui::envelope::PhaseRun &run = runs.items[static_cast<size_t>(i)];
+    draw_list->AddPolyline(&path.pixels[run.first],
+                           static_cast<int>(run.count),
+                           phase_color(colors, run.phase), ImDrawFlags_None,
+                           thickness);
+  }
+}
+
+/// TL and SL have no segment of their own: they are levels, so they light up
+/// as a rule across the graph at the level they set.
+void draw_level_markers(ImDrawList *draw_list, const EnvelopeCurve &curve,
+                        const UIState::EnvelopeState &state,
+                        const PlotArea &plot) {
+  const float thickness = ui::scale::px(1.0f);
+  const auto rule = [&](double out, ImU32 color) {
+    const float y = plot.y_of(out);
+    draw_list->AddLine(ImVec2(plot.min.x, y), ImVec2(plot.max.x, y), color,
+                       thickness);
+  };
+
+  if (state.total_level != UIState::EnvelopeState::SliderState::None) {
+    rule(curve.peak_out, color_from_slider_state(state.total_level));
+  }
+  if (state.sustain_level != UIState::EnvelopeState::SliderState::None) {
+    rule(curve.sustain_out, color_from_slider_state(state.sustain_level));
+  }
+}
+
+/// One voice's cursor: a thin vertical rule at where that note has actually
+/// got to on its own envelope.
+void draw_voice_cursor(ImDrawList *draw_list, const PlotArea &plot, double ms,
+                       ImU32 color) {
+  const float x = plot.x_of(ms);
+  draw_list->AddLine(ImVec2(x, plot.min.y), ImVec2(x, plot.max.y), color,
+                     ui::scale::px(1.0f));
+}
+
+/// The voice's own attack, decay and sustain, in one flat colour at a fraction
+/// of the reference curve's weight. No release: the release this voice took is
+/// drawn separately, from where the key actually came up.
+void draw_voice_curve(ImDrawList *draw_list, const EnvelopeCurve &curve,
+                      const PlotArea &plot, double to_ms, ImU32 color) {
+  if (curve.held.points.size() < 2) {
+    return;
+  }
+  TracePath &path = trace_scratch();
+  ui::envelope::build_trace_path(path.vertices, curve.held,
+                                 curve.held_tail_slope, plot.span_ms, 0.0,
+                                 to_ms);
+  stroke_path(draw_list, path, plot, color);
+}
+
+/// The release this voice is actually taking: the drawn release trace entered
+/// at the level the key came up on. A line, like the voice's own attack and
+/// decay, so it reads as this voice rather than as the reference.
+void draw_voice_release_line(ImDrawList *draw_list, const EnvelopeCurve &curve,
+                             const PlotArea &plot, double from_ms,
+                             double origin_ms, double to_ms, ImU32 color) {
+  if (from_ms < 0.0 || origin_ms < 0.0 || curve.release.points.size() < 2) {
+    return;
+  }
+  TracePath &path = trace_scratch();
+  // The release keeps its shape and is slid along to where the key came up.
+  ui::envelope::build_trace_path(path.vertices, curve.release,
+                                 curve.release_tail_slope, plot.span_ms,
+                                 from_ms, to_ms, origin_ms - from_ms);
+  stroke_path(draw_list, path, plot, color);
+}
+
+/// The single warning, bottom left. Wrapped rather than clipped: it is a
+/// little wider than the graph at the smallest UI scale.
+void draw_warning(ImDrawList *draw_list, const std::string &warning,
+                  const PlotArea &plot) {
+  if (warning.empty()) {
+    return;
+  }
+  const char *text = warning.c_str();
+  const char *text_end = text + warning.size();
+  const float inset = ui::scale::px(3.0f);
+  const float wrap_width = plot.width() - inset * 2.0f;
+  const ImVec2 size = ImGui::CalcTextSize(text, text_end, false, wrap_width);
+  const ImVec2 pos(plot.min.x + inset, plot.max.y - size.y - inset);
+  draw_list->AddText(
+      ImGui::GetFont(), ImGui::GetFontSize(), pos,
+      color_with_alpha(ImGui::GetColorU32(ImGuiCol_Text), kWarningAlpha), text,
+      text_end, wrap_width);
+}
+
+} // namespace
+
+EnvelopeVoices collect_envelope_voices(const VoiceActivityFrame &frame) {
+  EnvelopeVoices out;
+  const double rate =
+      frame.sample_rate > 0 ? static_cast<double>(frame.sample_rate) : 44100.0;
+  const double ms_per_sample = 1000.0 / rate;
+
+  // `now` is never behind a stamp, but saturating keeps the arithmetic safe
+  // across an engine restart, which puts the clock back to zero.
+  const auto elapsed_ms = [&](uint64_t from) {
+    return frame.now_samples > from
+               ? static_cast<double>(frame.now_samples - from) * ms_per_sample
+               : 0.0;
+  };
+
+  // Newest first: `sequence` counts key-ons across the whole allocator, so it
+  // is the recency order, and a stolen channel arrives as a strictly greater
+  // sequence.
+  std::array<const VoiceActivity *, 6> ordered{};
+  int found = 0;
+  for (const VoiceActivity &voice : frame.voices) {
+    if (voice.valid()) {
+      ordered[found++] = &voice;
+    }
+  }
+  std::sort(ordered.begin(), ordered.begin() + found,
+            [](const VoiceActivity *a, const VoiceActivity *b) {
+              return a->sequence > b->sequence;
+            });
+
+  float recency = 1.0f;
+  for (int i = 0; i < found; ++i) {
+    const VoiceActivity &voice = *ordered[i];
+    EnvelopeVoices::Voice item;
+    item.sequence = voice.sequence;
+    item.midi_note = voice.midi_note;
+    item.since_key_on_ms = elapsed_ms(voice.key_on_sample);
+    item.since_key_off_ms =
+        voice.held ? -1.0 : elapsed_ms(voice.key_off_sample);
+    if (ui::envelope::voice_expired(item.since_key_off_ms)) {
+      continue;
+    }
+    item.recency = recency;
+    recency *= kVoiceRecencyFalloff;
+    out.items[out.count++] = item;
+  }
+  return out;
+}
+
+ui::envelope::EnvelopeHandles
+render_envelope_image(const ym2612::OperatorSettings &op,
+                      const UIState::EnvelopeState &slider_state, ImVec2 size,
+                      const EnvelopeVoices &voices) {
+  // Before BeginChild, so the ID comes from the operator's stack rather than
+  // from the child window.
+  EnvelopeSlot &slot = slot_for(ImGui::GetID("##envelope_curve"));
+  const EnvelopeCurve &curve = slot.curve.get(op);
+
+  // A parameter is lit by its slider or by the handle that sets it, whichever
+  // is the stronger: the two are pointed at in the same place on the graph.
+  UIState::EnvelopeState state = slider_state;
+  const auto raise = [](UIState::EnvelopeState::SliderState &into,
+                        UIState::EnvelopeState::SliderState from) {
+    if (static_cast<int>(from) > static_cast<int>(into)) {
+      into = from;
+    }
+  };
+  raise(state.total_level, slider_state.handles.total_level);
+  raise(state.attack_rate, slider_state.handles.attack_rate);
+  raise(state.decay_rate, slider_state.handles.decay_rate);
+  raise(state.sustain_level, slider_state.handles.sustain_level);
+  raise(state.sustain_rate, slider_state.handles.sustain_rate);
+  raise(state.release_rate, slider_state.handles.release_rate);
+
+  PlotArea plot;
+  const double target_ms = std::max(curve.span_ms, 1.0);
+
+  // The axis follows the target rather than jumping to it. The curve is
+  // already in milliseconds, so this is purely a change of scale at draw time
+  // and nothing is recomputed. The snap threshold is target/width, which is
+  // the difference that moves the right-hand end of the content by one pixel.
+  // Kept outside the visibility test below, so a graph scrolled back into view
+  // is where it would have been rather than starting the journey again. A held
+  // handle stops it outright: the axis must not rescale under the pointer that
+  // is dragging it.
+  const float plot_width = std::max(size.x - 2.0f, 1.0f);
+  if (!state.handle_active) {
+    slot.drawn_span_ms =
+        approach_span(slot.drawn_span_ms, target_ms, ImGui::GetIO().DeltaTime,
+                      target_ms / plot_width);
+  }
+  plot.span_ms = std::max(slot.drawn_span_ms, 1.0);
+
+  // BeginChild answers whether anything inside it can be seen; without the
+  // test an off-screen graph still builds its whole vertex stream for the
+  // clipper to throw away.
+  const bool visible =
+      ImGui::BeginChild("EnvelopeImage", size, false, ImGuiWindowFlags_NoScrollbar);
+  if (!visible) {
+    return {};
+  }
 
   ImDrawList *draw_list = ImGui::GetWindowDrawList();
 
-  ImVec2 canvas_min = ImGui::GetCursorScreenPos();
-  ImVec2 canvas_max = ImVec2(canvas_min.x + size.x, canvas_min.y + size.y);
+  const ImVec2 canvas_min = ImGui::GetCursorScreenPos();
+  const ImVec2 canvas_max(canvas_min.x + size.x, canvas_min.y + size.y);
 
-  // draw border
-  ImU32 border_color = ImGui::GetColorU32(ImGuiCol_Separator);
-  draw_list->AddRect(canvas_min, canvas_max, border_color);
+  draw_list->AddRect(canvas_min, canvas_max,
+                     ImGui::GetColorU32(ImGuiCol_Separator));
 
-  const float draw_width = size.x - 2;
-  const float draw_height = size.y - 2;
-  const ImVec2 draw_min = ImVec2(canvas_min.x, canvas_min.y);
+  // The time labels get a strip of their own along the top: a curve at full
+  // volume runs along the very top of the plot.
+  const float label_height = ImGui::GetTextLineHeight();
+  plot.min =
+      to_point(ImVec2(canvas_min.x + 1.0f, canvas_min.y + label_height + 1.0f));
+  plot.max = to_point(ImVec2(canvas_max.x - 1.0f, canvas_max.y - 1.0f));
 
-  auto total_level_height = draw_height * op.total_level / 127.0f;
-  auto sustain_level_height =
-      total_level_height +
-      (draw_height - total_level_height) * op.sustain_level / 15.0f;
-  const float line_thickness = 3.0f;
+  // The note the axis is drawn at, at the far end of the same strip; the
+  // milliseconds stop short of it.
+  const float label_baseline = canvas_min.y + 1.0f;
+  const std::string note_name =
+      ym2612::Note::from_midi_note(
+          static_cast<uint8_t>(ui::envelope::reference_midi_note()))
+          .name();
+  const float note_x = plot.max.x - ImGui::CalcTextSize(note_name.c_str()).x;
+  draw_list->AddText(ImVec2(note_x, label_baseline), axis_label_color(),
+                     note_name.c_str());
 
-  ImVec2 envelope_points[5];
-  ImU32 envelope_colors[4];
-  envelope_points[0] = ImVec2(0, draw_height);
-  envelope_colors[0] = color_from_slider_state(state.attack_rate);
-  envelope_colors[1] = color_from_slider_state(state.decay_rate);
-  envelope_colors[2] = color_from_slider_state(state.sustain_rate);
-  envelope_colors[3] =
-      color_from_slider_state(UIState::EnvelopeState::SliderState::None);
+  draw_time_grid(draw_list, plot, label_baseline, note_x - ui::scale::px(6.0f));
 
-  // Attack Rate
-  if (op.attack_rate == 0) {
-    envelope_points[1] = envelope_points[0];
-    envelope_points[2] = envelope_points[0];
-    envelope_points[3] = envelope_points[0];
-    envelope_colors[1] = color_from_slider_state(state.attack_rate);
-    envelope_colors[2] = color_from_slider_state(state.attack_rate);
-    envelope_colors[3] = color_from_slider_state(state.attack_rate);
-  } else {
-    float attack_width = 0;
-    if (op.attack_rate != 31) {
-      attack_width += (127.0f - total_level_height) /
-                      compute_effective_rate_attack(op.attack_rate);
+  const PhaseColors colors = {
+      color_from_slider_state(state.attack_rate),
+      color_from_slider_state(state.decay_rate),
+      color_from_slider_state(state.sustain_rate),
+      color_from_slider_state(state.release_rate),
+  };
+  // What is sounding, newest first, which is also the order the frame's one
+  // curve build is offered in.
+  struct DrawnVoice {
+    const EnvelopeCurve *curve;
+    ui::envelope::VoiceCursor cursor;
+    bool cursor_on_axis;
+    float alpha;
+  };
+  // While a slider is being dragged the registers move under the cache every
+  // frame, so a curve simulated now is dropped before it is ever drawn twice.
+  int nothing_to_spend = 0;
+  int &build_budget = envelope_slider_active(state) ? nothing_to_spend
+                                                    : voice_build_budget();
+
+  DrawnVoice drawn[6];
+  int drawn_count = 0;
+  for (int i = 0; i < voices.count; ++i) {
+    const EnvelopeVoices::Voice &voice = voices.items[i];
+    if (already_finished(slot, voice.sequence)) {
+      continue; // this note is over on this operator
     }
-    envelope_points[1] = ImVec2(attack_width, total_level_height);
-
-    // Decay Rate
-    if (op.decay_rate == 0 && op.sustain_level != 0) {
-      envelope_points[2] = envelope_points[1];
-      envelope_points[3] = envelope_points[1];
-      envelope_colors[2] = color_from_slider_state(state.decay_rate);
-      envelope_colors[3] = color_from_slider_state(state.decay_rate);
-    } else {
-      float decay_width = attack_width;
-      if (op.decay_rate != 31 && op.sustain_level != 0) {
-        decay_width += (sustain_level_height - total_level_height) /
-                       compute_effective_rate_decay(op.decay_rate);
-      }
-      envelope_points[2] = ImVec2(decay_width, sustain_level_height);
-
-      // Sustain Rate
-      if (op.sustain_rate == 0) {
-        envelope_points[3] = envelope_points[2] + ImVec2(3, 0);
-        envelope_colors[3] = color_from_slider_state(state.sustain_rate);
-      } else {
-        float sustain_rate_width = decay_width;
-        if (op.sustain_rate != 31) {
-          sustain_rate_width += (draw_height - sustain_level_height) /
-                                compute_effective_rate_decay(op.sustain_rate);
-        }
-        envelope_points[3] = ImVec2(sustain_rate_width, draw_height);
-      }
+    const EnvelopeCurve *voice_curve =
+        slot.voices.get(op, ym2612_eg::NotePitch::from_midi(voice.midi_note),
+                        curve, build_budget);
+    if (voice_curve == nullptr) {
+      continue; // its curve is being built next frame
     }
+    const ui::envelope::VoiceCursor cursor =
+        ui::envelope::cursor_for_voice(*voice_curve, voice.since_key_on_ms,
+                                       voice.since_key_off_ms, plot.span_ms);
+    const ui::envelope::VoiceVisibility shown =
+        ui::envelope::voice_visibility(cursor, plot.span_ms);
+    if (shown.finished) {
+      // The silence a released voice sits in only ever gets older, so nothing
+      // can bring it back.
+      remember_finished(slot, voice.sequence);
+      continue;
+    }
+    const float alpha = voice.recency * static_cast<float>(shown.fade);
+    if (alpha < kVoiceMinAlpha) {
+      continue;
+    }
+    drawn[drawn_count++] =
+        DrawnVoice{voice_curve, cursor, shown.cursor_on_axis, alpha};
   }
 
-  float release_width = (draw_height - total_level_height) /
-                        compute_effective_rate_release(op.release_rate);
-  auto r = fmin(4.0f, draw_width / fmax(release_width, envelope_points[3].x));
-  for (int i = 0; i < 4; i++) {
-    envelope_points[i].x *= r;
+  // Ghost curves oldest first, so the newest is the one on top of the others
+  // -- and all of them under the curve being edited.
+  const ImU32 ghost_base = ImGui::GetColorU32(ImGuiCol_Text);
+  for (int i = drawn_count - 1; i >= 0; --i) {
+    // Nothing to draw when the note shares the reference note's key-scale
+    // value: its curve IS the one already on screen.
+    if (drawn[i].curve == &curve) {
+      continue;
+    }
+    draw_voice_curve(
+        draw_list, *drawn[i].curve, plot, drawn[i].cursor.held_to_ms,
+        color_with_alpha(ghost_base, drawn[i].alpha * kVoiceCurveAlpha));
   }
-  release_width *= r;
-  ImVec2 rr0 = ImVec2(0, total_level_height);
-  ImVec2 rr1 = ImVec2(release_width, draw_height);
-  ImVec2 rr2 = ImVec2(0, draw_height);
-
-  // draw phase
-
-  // draw grid
-  ImU32 grid_color = ImGui::GetColorU32(ImGuiCol_Separator);
-
-  auto i = 0;
-  while (true) {
-    auto grid_x = i * 12.4f * r;
-    if (grid_x > draw_width)
-      break;
-    draw_list->AddLine(ImVec2(grid_x, 0) + draw_min,
-                       ImVec2(grid_x, draw_height) + draw_min, grid_color);
-    i++;
-  }
-  i = 0;
-  while (true) {
-    auto grid_y = i * 12.4f * 4.0f;
-    if (grid_y > draw_height)
-      break;
-    draw_list->AddLine(ImVec2(0, draw_height - grid_y) + draw_min,
-                       ImVec2(draw_width, draw_height - grid_y) + draw_min,
-                       grid_color);
-    i++;
+  // The release each voice is taking, over the ghosts and under the reference
+  // curve. Drawn whatever its key scale: it is the one part of a note the
+  // reference curve cannot stand in for.
+  for (int i = drawn_count - 1; i >= 0; --i) {
+    draw_voice_release_line(
+        draw_list, *drawn[i].curve, plot, drawn[i].cursor.release_from_ms,
+        drawn[i].cursor.release_origin_ms, drawn[i].cursor.ms,
+        color_with_alpha(ghost_base, drawn[i].alpha * kVoiceCurveAlpha));
   }
 
-  // draw Release Rate
-  draw_list->AddTriangleFilled(
-      rr0 + draw_min, rr1 + draw_min, rr2 + draw_min,
-      color_with_alpha(color_from_slider_state(state.release_rate), 0.4f));
+  draw_release_area(draw_list, curve, plot,
+                    phase_color(colors, ym2612_eg::EgPhase::Release));
+  draw_held_line(draw_list, curve, plot, colors);
+  draw_level_markers(draw_list, curve, state, plot);
+  // Over everything, so a cursor is never hidden under the curve it measures.
+  const ImU32 cursor_base = ImGui::GetColorU32(ImGuiCol_FrameBgActive);
+  for (int i = drawn_count - 1; i >= 0; --i) {
+    if (!drawn[i].cursor_on_axis) {
+      continue;
+    }
+    draw_voice_cursor(
+        draw_list, plot, drawn[i].cursor.ms,
+        color_with_alpha(cursor_base, drawn[i].alpha * kVoiceCursorAlpha));
+  }
+  draw_warning(draw_list, curve.warning, plot);
 
-  // draw Envelope
-  envelope_points[4] = ImVec2(draw_width, envelope_points[3].y);
-  for (int i = 0; i < 4; i++) {
-    draw_list->AddLine(envelope_points[i] + draw_min,
-                       envelope_points[i + 1] + draw_min, envelope_colors[i],
-                       line_thickness);
+  // The handles are the editor's to place, so all that is settled here is
+  // where they would go. They keep out of the way until the pointer is on the
+  // graph, and stay up for as long as one is held wherever the pointer wanders
+  // off to.
+  const bool wanted = state.handle_active || ImGui::IsWindowHovered();
+  if (!wanted) {
+    return {};
   }
-  // draw Total Level
-  if (state.total_level != UIState::EnvelopeState::SliderState::None) {
-    draw_list->AddLine(ImVec2(0, total_level_height) + draw_min,
-                       ImVec2(draw_width, total_level_height) + draw_min,
-                       color_from_slider_state(state.total_level), 1.0f);
-  }
-  // draw Sustain Level
-  if (state.sustain_level != UIState::EnvelopeState::SliderState::None) {
-    draw_list->AddLine(ImVec2(0, sustain_level_height) + draw_min,
-                       ImVec2(draw_width, sustain_level_height) + draw_min,
-                       color_from_slider_state(state.sustain_level), 1.0f);
-  }
-
-  ImGui::EndChild();
+  const ui::envelope::HandleMetrics unscaled;
+  const ui::envelope::HandleMetrics metrics{
+      ui::scale::px(unscaled.radius),
+      ui::scale::px(unscaled.grab),
+      ui::scale::px(unscaled.min_sustain_height),
+      ui::scale::px(unscaled.min_sustain_width),
+  };
+  return ui::envelope::handle_layout(curve, plot, op.ssg_enable, metrics);
 }
+
+void draw_envelope_handle(const ui::envelope::EnvelopeHandles &handles,
+                          ui::envelope::HandleIndex handle,
+                          UIState::EnvelopeState::SliderState state) {
+  const ui::envelope::EnvelopeHandle &item = handles.items[handle];
+  const ImU32 color = color_from_slider_state(state);
+  ImGui::GetWindowDrawList()->AddCircleFilled(
+      to_imvec(item.pos), handles.metrics.radius,
+      state == UIState::EnvelopeState::SliderState::None
+          ? color_with_alpha(color, kHandleIdleAlpha)
+          : color);
+}
+
+void end_envelope_image() { ImGui::EndChild(); }
 
 } // namespace ui

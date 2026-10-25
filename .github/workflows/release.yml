@@ -33,7 +33,7 @@ jobs:
   build-linux:
     needs: create_release
     runs-on: ubuntu-latest
-    container: ubuntu:20.04
+    container: ubuntu:22.04
     strategy:
       fail-fast: false
       matrix:
@@ -69,7 +69,7 @@ jobs:
             libcurl4-openssl-dev
           curl -fsSL https://apt.kitware.com/keys/kitware-archive-latest.asc | gpg --dearmor -o /usr/share/keyrings/kitware-archive-keyring.gpg
           chmod go+r /usr/share/keyrings/kitware-archive-keyring.gpg
-          echo 'deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ focal main' > /etc/apt/sources.list.d/kitware.list
+          echo 'deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ jammy main' > /etc/apt/sources.list.d/kitware.list
           curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg
           chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
           echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
@@ -79,6 +79,8 @@ jobs:
         run: cmake -S . -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" ${{ matrix.cmake_flags }}
       - name: Build
         run: cmake --build "$BUILD_DIR" --config $BUILD_TYPE --parallel
+      - name: Test
+        run: ctest --test-dir "$BUILD_DIR" --output-on-failure
       - name: Install
         run: cmake --install "$BUILD_DIR" --config $BUILD_TYPE --prefix "$INSTALL_PREFIX"
       - name: Package Artifact
@@ -137,6 +139,8 @@ jobs:
         run: cmake -S . -B build-release -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX"
       - name: Build
         run: cmake --build build-release --config $BUILD_TYPE --parallel
+      - name: Test
+        run: ctest --test-dir build-release --output-on-failure
       - name: Install
         run: cmake --install build-release --config $BUILD_TYPE --prefix "$INSTALL_PREFIX"
       - name: Package Artifact
@@ -179,6 +183,8 @@ jobs:
         run: cmake -S . -B build-release -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX"
       - name: Build
         run: cmake --build build-release --config $BUILD_TYPE --parallel
+      - name: Test
+        run: ctest --test-dir build-release --output-on-failure
       - name: Install
         run: cmake --install build-release --config $BUILD_TYPE --prefix "$INSTALL_PREFIX"
       - name: Package Artifact
@@ -206,7 +212,7 @@ jobs:
 
   build-windows:
     needs: create_release
-    runs-on: windows-latest
+    runs-on: windows-2022
     env:
       BUILD_TYPE: Release
       VERSION: ${{ github.ref_name }}
@@ -235,6 +241,9 @@ jobs:
       - name: Build
         shell: bash
         run: cmake --build build-release --config $BUILD_TYPE --parallel
+      - name: Test
+        shell: bash
+        run: ctest --test-dir build-release --build-config $BUILD_TYPE --output-on-failure
       - name: Install
         shell: bash
         run: cmake --install build-release --config $BUILD_TYPE --prefix "$INSTALL_PREFIX"

@@ -1,8 +1,8 @@
 #pragma once
 
 #include "channel_allocator.hpp"
-#include "patch_repository.hpp"
 #include "formats/patch_registry.hpp"
+#include "patch_repository.hpp"
 #include "patches/filename_utils.hpp"
 #include "preferences/preference_manager.hpp"
 #include "system/path_service.hpp"
@@ -11,6 +11,7 @@
 #include <array>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -18,6 +19,8 @@
 class AudioManager;
 
 namespace patches {
+
+class PersistentParseCache;
 
 struct SaveResult {
   enum class Status {
@@ -46,11 +49,15 @@ struct SaveResult {
   bool is_duplicated() const { return status == Status::Duplicated; }
 };
 
-using ExportFormatInfo = formats::ExportFormatInfo;
+using SaveFormatInfo = formats::SaveFormatInfo;
 
 class PatchSession {
 public:
-  PatchSession(megatoy::system::PathService &directories, AudioManager &audio);
+  enum class RememberPatchPath { Yes, No };
+
+  PatchSession(megatoy::system::PathService &directories,
+               PreferenceManager &preferences, AudioManager &audio,
+               PersistentParseCache *persistent_cache = nullptr);
 
   // Patch access
   ym2612::Patch &current_patch();
@@ -60,32 +67,88 @@ public:
   bool is_modified() const;
   void mark_as_clean();
 
-  // Path management
+  // The source path is the file Save targets. The selection path identifies
+  // one visible repository entry, which can be a version inside that file.
   const std::string &current_patch_path() const;
-  void set_current_patch_path(const std::filesystem::path &path);
+  void
+  set_current_patch_path(const std::filesystem::path &path,
+                         RememberPatchPath remember = RememberPatchPath::Yes);
+  const std::string &current_patch_selection_path() const;
+  void set_current_patch_selection_path(const std::filesystem::path &path);
 
   // Repository access
   PatchRepository &repository();
   const PatchRepository &repository() const;
 
-  // Initialization and directory management
+  // Initialization and workspace management
   void initialize_patch_defaults();
-  void refresh_directories();
+  /**
+   * The patch a new one starts from: the built-in presets' init.dmp when it
+   * is there, otherwise megatoy's own defaults. The same patch a fresh launch
+   * opens.
+   */
+  ym2612::Patch default_patch() const;
+  /// Rebuild the repository if the workspace folder list has changed.
+  void sync_workspace();
 
   // Patch loading
+  bool load_patch_from_entry(const PatchEntry &entry);
+  bool restore_patch(const std::filesystem::path &relative_path);
   void set_current_patch(const ym2612::Patch &patch,
-                         const std::filesystem::path &source_path);
+                         const std::filesystem::path &source_path,
+                         RememberPatchPath remember = RememberPatchPath::Yes);
 
   // Audio integration
   void apply_patch_to_audio();
+  bool apply_patch_to_audio_if_changed();
 
   // File operations
-  SaveResult save_current_patch(bool force_overwrite = false,
-                                std::string_view preferred_extension = {});
-  SaveResult export_current_patch_as(const ExportFormatInfo &format);
-  std::optional<ExportFormatInfo>
-  find_export_format(const std::string &extension) const;
-  std::vector<ExportFormatInfo> export_formats() const;
+  /**
+   * Write the patch back to its source file when that is safe, otherwise fall
+   * back to Save As.
+   *
+   * In-place overwriting requires a single-patch, writable format in a
+   * writable workspace folder. Read-only formats (.dmf, .fur, .opm,
+   * .rym2612), instrument banks and the built-in presets all go through the
+   * dialog instead, so nothing is destroyed by a stray Ctrl+S.
+   */
+  SaveResult save_current_patch(std::string_view preferred_extension = {});
+  SaveResult save_current_patch_as(std::string_view preferred_extension = {},
+                                   std::string_view filename_stem = {});
+  SaveResult
+  save_current_patch_as_forced(std::string_view preferred_extension = {},
+                               std::string_view filename_stem = {});
+  /// Save As into one named workspace folder rather than the default one.
+  SaveResult save_current_patch_as_in(const std::filesystem::path &folder,
+                                      std::string_view preferred_extension = {},
+                                      std::string_view filename_stem = {});
+  SaveResult
+  save_current_patch_as_in_forced(const std::filesystem::path &folder,
+                                  std::string_view preferred_extension = {},
+                                  std::string_view filename_stem = {});
+  /// True when a new patch may be written straight into `folder`.
+  bool can_create_patch_in(const std::filesystem::path &folder) const;
+  /**
+   * Write default_patch() into `folder` as `stem` + `extension`, then open it.
+   *
+   * On success the repository has been refreshed and the new file is the
+   * current patch and the browser's selection, exactly as if the user had
+   * clicked it there.
+   */
+  SaveResult create_patch_in(const std::filesystem::path &folder,
+                             const std::string &stem,
+                             std::string_view extension);
+  /**
+   * Create the folder `name` inside `parent`, under the same conditions as
+   * create_patch_in(), and refresh the repository. The editor is left as it
+   * is.
+   */
+  SaveResult create_folder_in(const std::filesystem::path &parent,
+                              const std::string &name);
+  bool rename_patch(const PatchEntry &entry, const std::string &new_stem);
+  std::optional<SaveFormatInfo>
+  find_save_format(const std::string &extension) const;
+  std::vector<SaveFormatInfo> save_formats() const;
 
   // Note management
   bool note_on(ym2612::Note note, uint8_t velocity,
@@ -93,32 +156,67 @@ public:
   bool note_off(ym2612::Note note);
   bool note_is_active(const ym2612::Note &note) const;
   void release_all_notes();
-  const std::array<bool, 6> &active_channels() const;
+  std::array<bool, 6> active_channels() const;
   const std::vector<ym2612::Note> active_notes() const;
+  /// What each channel is playing -- or was, until its key came up -- with
+  /// the chip's clock, so the envelope graph can place a cursor on it.
+  VoiceActivityFrame voice_activity() const;
 
   // Snapshot functionality for undo/redo
   struct PatchSnapshot {
     ym2612::Patch original_patch;
     ym2612::Patch patch;
     std::string path;
+    std::string selection_path;
     bool operator==(const PatchSnapshot &other) const {
-      return patch == other.patch && path == other.path;
+      return patch == other.patch && path == other.path &&
+             selection_path == other.selection_path;
     }
   };
 
   PatchSnapshot capture_snapshot() const;
   void restore_snapshot(const PatchSnapshot &snapshot);
 
+  /**
+   * True when Save writes straight back to the current file. False means the
+   * next Save opens a dialog -- because the patch has no file yet, came from
+   * a read-only folder, or is one instrument out of a bank.
+   */
+  bool can_save_in_place() const;
+
   bool current_patch_is_user_patch() const;
   const char *save_label_for(bool is_user_patch) const;
 
+  /// The workspace folder holding the current patch, when it may be written
+  /// to. Empty for a new patch, the built-in presets, or a read-only folder.
+  std::optional<std::filesystem::path> writable_source_folder() const;
+
 private:
+  /// default_patch() together with the file it came from, empty when the
+  /// built-in defaults were used.
+  struct DefaultPatch {
+    ym2612::Patch patch;
+    std::filesystem::path source;
+  };
+  DefaultPatch default_patch_source() const;
+
+  /// `folder` names one workspace folder to write into; empty means the
+  /// repository's own default target.
+  SaveResult save_current_patch_as_impl(std::string_view preferred_extension,
+                                        std::string_view filename_stem,
+                                        bool overwrite,
+                                        const std::filesystem::path &folder);
+  void set_file_identity(const std::filesystem::path &path);
+
   megatoy::system::PathService &directories_;
+  PreferenceManager &preferences_;
   AudioManager &audio_;
   std::unique_ptr<PatchRepository> repository_;
-  ChannelAllocator channel_allocator_;
   ym2612::Patch current_patch_;
+  ym2612::Patch last_applied_;
+  bool has_applied_patch_ = false;
   std::string current_patch_path_;
+  std::string current_patch_selection_path_;
   ym2612::Patch original_patch_; // For tracking modifications
 };
 

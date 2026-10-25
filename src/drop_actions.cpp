@@ -1,7 +1,9 @@
 #include "drop_actions.hpp"
 
 #include "app_services.hpp"
+#include "core/status.hpp"
 #include "formats/patch_loader.hpp"
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -30,18 +32,12 @@ void handle_multi(Environment &env, std::vector<ym2612::Patch> patches,
   drop.pending_instruments_path = path;
   drop.selected_instrument = 0;
   drop.show_picker_for_multiple_instruments = true;
-  drop.show_error_popup = false;
-  drop.error_message.clear();
 }
 
 void handle_failure(Environment &env, const std::string &message) {
-  auto &drop = env.ui_state.drop_state;
-  drop.instruments.clear();
-  drop.pending_instruments_path.clear();
-  drop.selected_instrument = 0;
-  drop.show_picker_for_multiple_instruments = false;
-  drop.error_message = message;
-  drop.show_error_popup = true;
+  reset_drop_state(env.ui_state.drop_state);
+  megatoy::status::error(message.empty() ? "Unsupported file format."
+                                         : message);
 }
 
 } // namespace
@@ -51,13 +47,26 @@ void reset_drop_state(UIState::DropState &drop) {
   drop.pending_instruments_path.clear();
   drop.selected_instrument = 0;
   drop.show_picker_for_multiple_instruments = false;
-  drop.show_error_popup = false;
-  drop.error_message.clear();
 }
 
 void handle_drop(Environment &env, const std::filesystem::path &path) {
   auto &drop = env.ui_state.drop_state;
-  drop.error_message.clear();
+
+  // A dropped directory is a workspace addition, not a patch load: the same
+  // gesture as dragging a folder into an editor. Files keep the old behavior.
+  std::error_code ec;
+  if (std::filesystem::is_directory(path, ec)) {
+    if (env.services.preference_manager.add_workspace_folder(path)) {
+      env.services.patch_session.sync_workspace();
+      megatoy::status::success("Added \"" + path.filename().string() +
+                               "\" to the workspace.");
+    } else {
+      megatoy::status::warning("\"" + path.filename().string() +
+                               "\" is already in the workspace.");
+    }
+    reset_drop_state(drop);
+    return;
+  }
 
   auto result = formats::load_patch_from_file(path);
   switch (result.status) {

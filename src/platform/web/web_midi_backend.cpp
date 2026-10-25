@@ -7,13 +7,60 @@
 #endif
 #include <vector>
 
+namespace {
+platform::web::WebMidiBackend *g_active_backend = nullptr;
+} // namespace
+
+extern "C" {
+
+EMSCRIPTEN_KEEPALIVE void megatoy_web_midi_message(int status, int data1,
+                                                   int data2) {
+  if (g_active_backend == nullptr) {
+    return;
+  }
+  g_active_backend->deliver(static_cast<unsigned char>(status),
+                            static_cast<unsigned char>(data1),
+                            static_cast<unsigned char>(data2));
+}
+
+} // extern "C"
+
 namespace platform::web {
+
+void WebMidiBackend::deliver(unsigned char status, unsigned char data1,
+                             unsigned char data2) {
+  const unsigned char type = status & 0xF0;
+  MidiMessage message;
+  message.port_name = "MIDI";
+
+  if (type == 0x90 && data2 > 0) {
+    message.type = MidiMessage::Type::NoteOn;
+    message.note = ym2612::Note::from_midi_note(data1 & 0x7f);
+    message.velocity = data2 & 0x7f;
+    emit(message);
+  } else if (type == 0x80 || (type == 0x90 && data2 == 0)) {
+    message.type = MidiMessage::Type::NoteOff;
+    message.note = ym2612::Note::from_midi_note(data1 & 0x7f);
+    message.velocity = data2 & 0x7f;
+    emit(message);
+  } else if (type == 0xe0) {
+    message.type = MidiMessage::Type::PitchBend;
+    message.pitch_bend = static_cast<uint16_t>(
+        (data1 & 0x7f) | (static_cast<uint16_t>(data2 & 0x7f) << 7));
+    emit(message);
+  } else if (type == 0xb0) {
+    message.type = MidiMessage::Type::ControlChange;
+    message.controller = data1 & 0x7f;
+    message.controller_value = data2 & 0x7f;
+    emit(message);
+  }
+}
 
 namespace {
 #if defined(MEGATOY_PLATFORM_WEB)
 void request_access_js() {
+  // clang-format off
   EM_ASM({
-    // clang-format off
     var state = Module['megatoyMidiState'];
     if (!state || !state.available) {
       return;
@@ -36,10 +83,18 @@ void request_access_js() {
       }
 
       function handleMessage(event) {
-        Module['megatoyMidiEvents'].push({
-          port : event.target && event.target.name ? event.target.name : 'MIDI',
-          data : Array.prototype.slice.call(event.data || [])
-        });
+        // Dispatched immediately rather than queued for the next rendered
+        // frame. Emscripten runs the audio callback on this same thread, so
+        // there is nothing to race with.
+        var d = event.data || [];
+        if (d.length < 2 || !Module['_megatoy_web_midi_message']) {
+          return;
+        }
+        var type = d[0] & 0xf0;
+        if (type !== 0x80 && type !== 0x90 && type !== 0xb0 && type !== 0xe0) {
+          return;
+        }
+        Module['_megatoy_web_midi_message'](d[0], d[1], d.length > 2 ? d[2] : 0);
       }
 
       access.inputs.forEach(
@@ -68,16 +123,16 @@ void request_access_js() {
           state.error =
               (err && err.message) ? err.message : "Failed to access WebMIDI.";
         });
-    // clang-format on
   });
+  // clang-format on
 }
 #endif
 } // namespace
 
 void WebMidiBackend::setup_js_state() const {
 #if defined(MEGATOY_PLATFORM_WEB)
+  // clang-format off
   EM_ASM({
-    // clang-format off
     if (Module['megatoyMidiSetup']) {
       return;
     }
@@ -94,8 +149,8 @@ void WebMidiBackend::setup_js_state() const {
         available ? "needs-permission" : "unavailable";
     Module['megatoyMidiState'].pending = false;
     Module['megatoyMidiState'].error = "";
-    // clang-format on
   });
+  // clang-format on
 #endif
 }
 
@@ -139,6 +194,7 @@ WebMidiBackend::WebStatus WebMidiBackend::read_status_from_js() const {
 }
 
 bool WebMidiBackend::initialize() {
+  g_active_backend = this;
 #if defined(MEGATOY_PLATFORM_WEB)
   setup_js_state();
   return true;
@@ -147,17 +203,19 @@ bool WebMidiBackend::initialize() {
 #endif
 }
 
-void WebMidiBackend::shutdown() {}
+void WebMidiBackend::shutdown() {
+  if (g_active_backend == this) {
+    g_active_backend = nullptr;
+  }
+}
 
 MidiBackend::StatusInfo WebMidiBackend::status() const {
   auto web_status = read_status_from_js();
   MidiBackend::StatusInfo info;
   info.message = web_status.message;
-  info.show_enable_button =
-      web_status.state == State::NeedsPermission ||
-      web_status.state == State::Error;
-  info.enable_button_disabled =
-      web_status.state == State::Pending;
+  info.show_enable_button = web_status.state == State::NeedsPermission ||
+                            web_status.state == State::Error;
+  info.enable_button_disabled = web_status.state == State::Pending;
   return info;
 }
 
@@ -190,42 +248,7 @@ void WebMidiBackend::poll(std::vector<MidiMessage> &events,
     ports_changed = true;
   }
 
-  val queue = module["megatoyMidiEvents"];
-  if (!queue.isUndefined()) {
-    while (queue["length"].as<int>() > 0) {
-      val evt = queue.call<val>("shift");
-      val data = evt["data"];
-      if (data.isUndefined()) {
-        continue;
-      }
-      int len = data["length"].as<int>();
-      if (len < 2) {
-        continue;
-      }
-      std::vector<unsigned char> bytes;
-      bytes.reserve(len);
-      for (int i = 0; i < len; ++i) {
-        bytes.push_back(static_cast<unsigned char>(data[i].as<int>()));
-      }
-      MidiMessage message;
-      unsigned char status = bytes[0];
-      unsigned char type = status & 0xF0;
-      unsigned char midi_note = (len > 1) ? bytes[1] : 0;
-      unsigned char velocity = (len > 2) ? bytes[2] : 0;
-      message.note = ym2612::Note::from_midi_note(midi_note);
-      message.velocity = velocity;
-      message.port_name = evt["port"].isUndefined()
-                              ? std::string("MIDI")
-                              : evt["port"].as<std::string>();
-      if (type == 0x90 && velocity > 0) {
-        message.type = MidiMessage::Type::NoteOn;
-        events.push_back(message);
-      } else if (type == 0x80 || (type == 0x90 && velocity == 0)) {
-        message.type = MidiMessage::Type::NoteOff;
-        events.push_back(message);
-      }
-    }
-  }
+  // Notes arrive through megatoy_web_midi_message, not from here.
 #else
   (void)events;
   (void)available_ports;

@@ -4,6 +4,7 @@
 #include "gui/components/preview/ssg_preview.hpp"
 #include "gui/imgui_ini_bridge.hpp"
 #include "gui/styles/theme.hpp"
+#include "gui/ui_scale.hpp"
 #include "gui/window_title.hpp"
 #include "platform/platform_config.hpp"
 #include <filesystem>
@@ -149,16 +150,9 @@ bool GuiManager::initialize(const std::string &window_title, int width,
 
   io.ConfigFlags |= ImGuiConfigFlags_DockingEnable; // Enable Docking
 
-  // Setup Dear ImGui style
-  ImGuiStyle &style = ImGui::GetStyle();
-  style.ScrollbarSize = 8;
-  style.ScrollbarRounding = 0;
-  style.ScrollbarPadding = 0;
-  style.SeparatorTextBorderSize = 1;
-  style.FramePadding = ImVec2(4, 2);
-
-  // Apply theme from preferences
-  set_theme(preferences_.theme());
+  // Apply theme and scale from preferences
+  theme_ = preferences_.theme();
+  apply_ui_scale(preferences_.ui_preferences().ui_scale);
 
   // Setup Platform/Renderer backends
   ImGui_ImplSDL3_InitForOpenGL(window_, gl_context_);
@@ -258,18 +252,17 @@ void GuiManager::setup_default_layout(unsigned int dockspace_id) {
   ImGuiID dock_id_left = ImGui::DockBuilderSplitNode(
       dock_main_id, ImGuiDir_Left, 0.35f, nullptr, &dock_main_id);
 
+  // This ImGui version clears DockOrder in DockBuilderDockWindow; render_all
+  // submits these windows in the same editor-then-Preferences tab order.
   ImGui::DockBuilderDockWindow(patch_editor_title.c_str(), dock_main_id);
-  ImGui::DockBuilderDockWindow(ui::PATCH_HISTORY_TITLE, dock_main_id);
-
+  ImGui::DockBuilderDockWindow(ui::PREFERENCES_TITLE, dock_main_id);
   ImGui::DockBuilderDockWindow(ui::PATCH_BROWSER_TITLE, dock_id_left);
 
   ImGui::DockBuilderDockWindow(ui::SOFT_KEYBOARD_TITLE, doc_id_down);
   ImGui::DockBuilderDockWindow(ui::MML_CONSOLE_TITLE, doc_id_down);
   ImGui::DockBuilderDockWindow(ui::PATCH_LAB_TITLE, doc_id_down);
 
-#if !defined(MEGATOY_PLATFORM_WEB)
   ImGui::DockBuilderDockWindow(ui::WAVEFORM_TITLE, doc_id_down_left);
-#endif
 
   // Finish the dockspace
   ImGui::DockBuilderFinish(dockspace_id);
@@ -304,34 +297,56 @@ void GuiManager::end_frame() {
   }
 }
 
-void GuiManager::poll_events() {
+bool GuiManager::is_minimized() const {
+  return window_ != nullptr &&
+         (SDL_GetWindowFlags(window_) & SDL_WINDOW_MINIMIZED) != 0;
+}
+
+void GuiManager::process_event(const SDL_Event &event) {
+  ImGui_ImplSDL3_ProcessEvent(&event);
+
+  switch (event.type) {
+  case SDL_EVENT_QUIT:
+    should_close_ = true;
+    break;
+  case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+    if (event.window.windowID == window_id_) {
+      should_close_ = true;
+    }
+    break;
+  case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
+    if (event.window.windowID == window_id_ &&
+        ui_scale_preference_ == ui::scale::kAuto) {
+      apply_ui_scale(ui_scale_preference_);
+    }
+    break;
+  case SDL_EVENT_DROP_FILE:
+    if (event.drop.windowID == window_id_ && event.drop.data != nullptr) {
+      std::string dropped_path(event.drop.data);
+      dispatch_drop_event(dropped_path.c_str());
+    }
+    break;
+  default:
+    break;
+  }
+}
+
+bool GuiManager::poll_events(int timeout_ms) {
   if (!initialized_) {
-    return;
+    return false;
   }
 
   SDL_Event event;
-  while (SDL_PollEvent(&event)) {
-    ImGui_ImplSDL3_ProcessEvent(&event);
-
-    switch (event.type) {
-    case SDL_EVENT_QUIT:
-      should_close_ = true;
-      break;
-    case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
-      if (event.window.windowID == window_id_) {
-        should_close_ = true;
-      }
-      break;
-    case SDL_EVENT_DROP_FILE:
-      if (event.drop.windowID == window_id_ && event.drop.data != nullptr) {
-        std::string dropped_path(event.drop.data);
-        dispatch_drop_event(dropped_path.c_str());
-      }
-      break;
-    default:
-      break;
-    }
+  bool received_event = false;
+  if (timeout_ms > 0 && SDL_WaitEventTimeout(&event, timeout_ms)) {
+    process_event(event);
+    received_event = true;
   }
+  while (SDL_PollEvent(&event)) {
+    process_event(event);
+    received_event = true;
+  }
+  return received_event;
 }
 
 void GuiManager::sync_imgui_ini() {
@@ -344,7 +359,10 @@ void GuiManager::apply_theme() {
   preferences_.set_theme(theme_);
 }
 
-void GuiManager::reset_layout() { first_frame_ = true; }
+void GuiManager::reset_layout() {
+  first_frame_ = true;
+  web_layout_loaded_ = false;
+}
 
 void GuiManager::set_fullscreen(bool enable) {
   if (!initialized_ || window_ == nullptr) {
@@ -387,23 +405,28 @@ bool GuiManager::supports_quit() const {
   return megatoy::platform::is_desktop();
 }
 
-bool GuiManager::supports_waveform() const {
-  // Waveform panel relies on native file IO.
-  return megatoy::platform::is_desktop();
-}
-
-bool GuiManager::supports_patch_history() const {
-  // ginpkg history is not supported on web builds.
-  return megatoy::platform::is_desktop();
-}
-
 void GuiManager::set_theme(ui::styles::ThemeId theme) {
   theme_ = theme;
-  ui::styles::apply_theme(theme_);
+  ui::styles::apply_style(theme_, ui_scale_);
   if (ImGui::GetCurrentContext() != nullptr) {
     ui::reset_algorithm_preview_textures();
     ui::reset_ssg_preview_textures();
   }
+}
+
+float GuiManager::display_scale() const {
+  if (window_ == nullptr) {
+    return 1.0f;
+  }
+  const float scale =
+      SDL_GetDisplayContentScale(SDL_GetDisplayForWindow(window_));
+  return scale > 0.0f ? scale : 1.0f;
+}
+
+void GuiManager::apply_ui_scale(float preference) {
+  ui_scale_preference_ = preference;
+  ui_scale_ = ui::scale::resolve(preference, display_scale());
+  ui::styles::apply_style(theme_, ui_scale_);
 }
 
 void GuiManager::set_imgui_ini_file(const std::string &path) {

@@ -1,15 +1,15 @@
 #include "patch_editor.hpp"
 #include "common.hpp"
+#include "gui/components/operator_commands.hpp"
 #include "gui/components/preview/algorithm_preview.hpp"
 #include "gui/save_export_actions.hpp"
-#include "gui/styles/megatoy_style.hpp"
+#include "gui/ui_scale.hpp"
+#include "gui/window_title.hpp"
 #include "operator_editor.hpp"
 #include "platform/platform_config.hpp"
-#include <cctype>
-#include <cstring>
 #include <filesystem>
-#include <optional>
 #include <imgui.h>
+#include <optional>
 
 namespace ui {
 
@@ -29,27 +29,23 @@ void track_patch_history(PatchEditorContext &context, const std::string &label,
   }
 }
 
-// ImGui callback to block invalid characters
-static int filename_input_callback(ImGuiInputTextCallbackData *data) {
-  if (data->EventFlag == ImGuiInputTextFlags_CallbackCharFilter) {
-    if (!patches::is_valid_filename_char(data->EventChar)) {
-      return 1; // Reject the character
-    }
-  }
-  return 0;
-}
-
 namespace {
 
-void render_save_export_buttons(PatchEditorContext &context, bool name_valid,
+#if defined(MEGATOY_PLATFORM_WEB)
+/// Bottom-left of the item just drawn, where a menu it opens belongs.
+ImVec2 menu_anchor_below_last_item() {
+  return ImVec2(ImGui::GetItemRectMin().x, ImGui::GetItemRectMax().y);
+}
+#endif
+
+void render_save_export_buttons(PatchEditorContext &context,
                                 PatchEditorState &state) {
   auto &patch_session = context.session;
 
   auto is_user_patch = patch_session.current_patch_is_user_patch();
   auto is_patch_modified = patch_session.is_modified();
 
-  auto save_button_is_disabled =
-      !name_valid || (is_user_patch && !is_patch_modified);
+  auto save_button_is_disabled = is_user_patch && !is_patch_modified;
 
   if (save_button_is_disabled) {
     ImGui::BeginDisabled(true);
@@ -58,7 +54,14 @@ void render_save_export_buttons(PatchEditorContext &context, bool name_valid,
   const char *save_label = save_label_for(patch_session, is_user_patch);
   ImVec2 pos = ImGui::GetCursorPos();
   if (ImGui::Button(save_label)) {
-    trigger_save(patch_session, state, is_user_patch);
+    if (is_user_patch) {
+      trigger_save(patch_session, state);
+    } else {
+      request_save_as(state);
+#if defined(MEGATOY_PLATFORM_WEB)
+      state.save_as_menu_anchor = menu_anchor_below_last_item();
+#endif
+    }
   }
 
   // for hover
@@ -72,16 +75,12 @@ void render_save_export_buttons(PatchEditorContext &context, bool name_valid,
     ImGui::BeginDisabled(true);
   }
   if (ImGui::IsItemHovered()) {
-    if (!name_valid) {
-      ImGui::SetTooltip("Enter a valid patch name to save");
-    } else if (!is_user_patch) {
+    if (!is_user_patch) {
       const auto &path = patch_session.current_patch_path();
       if (path.ends_with(".ginpkg")) {
         ImGui::SetTooltip("Save version to %s", path.c_str());
       } else {
-        ImGui::SetTooltip("Save to %s/%s.ginpkg",
-                          patch_session.repository().primary_writable_label().c_str(),
-                          patch_session.current_patch().name.c_str());
+        ImGui::SetTooltip("Choose a filename and format");
       }
     } else if (!is_patch_modified) {
       ImGui::SetTooltip("Patch is not modified");
@@ -91,26 +90,14 @@ void render_save_export_buttons(PatchEditorContext &context, bool name_valid,
     ImGui::EndDisabled();
   }
 
-  ImGui::SameLine();
-  if (!name_valid) {
-    ImGui::BeginDisabled(true);
-  }
-  if (ImGui::Button("Duplicate...")) {
-    start_duplicate_dialog(context.session, state);
-  }
-  if (!name_valid) {
-    ImGui::EndDisabled();
-  }
-
-  if (!name_valid) {
-    ImGui::BeginDisabled(true);
-  }
-  ImGui::SameLine();
-  if (ImGui::Button("Export...")) {
-    ImGui::OpenPopup("Export Options");
-  }
-  if (!name_valid) {
-    ImGui::EndDisabled();
+  if (is_user_patch) {
+    ImGui::SameLine();
+    if (ImGui::Button("Save As...")) {
+      request_save_as(state);
+#if defined(MEGATOY_PLATFORM_WEB)
+      state.save_as_menu_anchor = menu_anchor_below_last_item();
+#endif
+    }
   }
 
   ImGui::SameLine();
@@ -120,78 +107,23 @@ void render_save_export_buttons(PatchEditorContext &context, bool name_valid,
 
   // Render popups in the same window/ID stack as the actions that open them.
   render_save_export_popups(patch_session, state);
-  render_duplicate_dialog(patch_session, state);
 }
 
-void render_patch_name_field(PatchEditorContext &context, ym2612::Patch &patch,
-                             bool name_valid) {
-  ImGui::PushItemWidth(200);
-  char name_buffer[64];
-  std::strncpy(name_buffer, patch.name.c_str(), sizeof(name_buffer) - 1);
-  name_buffer[sizeof(name_buffer) - 1] = '\0';
-
-  if (ImGui::InputText("Name", name_buffer, sizeof(name_buffer),
-                       ImGuiInputTextFlags_CallbackCharFilter,
-                       filename_input_callback)) {
-    patch.name = std::string(name_buffer);
-  }
-
-  track_patch_history(context, "Patch Name", "meta.name");
-
-  if (!name_valid && !patch.name.empty()) {
-    ImGui::SameLine();
-    ImGui::TextColored(styles::color(styles::MegatoyCol::StatusWarning),
-                       "Invalid filename");
-  }
-  ImGui::PopItemWidth();
-}
-
-void render_patch_metadata(PatchEditorContext &context, ym2612::Patch &patch,
+void render_patch_metadata(PatchEditorContext &context,
                            PatchEditorState &state) {
-  const bool name_valid = is_patch_name_valid(patch);
-
-  render_save_export_buttons(context, name_valid, state);
-
-  std::optional<patches::ExportFormatInfo> chosen_format;
-  if (ImGui::BeginPopup("Export Options")) {
-    auto formats = context.session.export_formats();
-    bool any = false;
-    for (const auto &fmt : formats) {
-      any = true;
-      std::string label = fmt.label.empty() ? fmt.extension : fmt.label;
-      if (!fmt.extension.empty()) {
-        label += " (" + fmt.extension + ")";
-      }
-      if (ImGui::MenuItem(label.c_str())) {
-        chosen_format = fmt;
-      }
-    }
-    if (!any) {
-      ImGui::MenuItem("No export formats available", nullptr, false, false);
-    }
-    ImGui::EndPopup();
-  }
-
-  if (chosen_format) {
-    trigger_export(context.session, state, *chosen_format);
-  }
-
-  render_patch_name_field(context, patch, name_valid);
-
+  render_save_export_buttons(context, state);
   ImGui::Spacing();
 }
 
-void render_lfo_section(PatchEditorContext &context, ym2612::Patch &patch,
-                        bool &settings_changed) {
+void render_lfo_section(PatchEditorContext &context, ym2612::Patch &patch) {
   ImGui::SeparatorText("Low Frequency Oscillator");
   bool lfo_enable = patch.global.lfo_enable;
   if (ImGui::Checkbox("LFO Enable", &lfo_enable)) {
-    patch.global.lfo_enable = lfo_enable;
-    settings_changed = true;
+    track_instant_patch_history(context, "LFO Enable",
+                                [&] { patch.global.lfo_enable = lfo_enable; });
   }
-  track_patch_history(context, "LFO Enable", "global.lfo_enable");
 
-  ImGui::PushItemWidth(hslider_width);
+  ImGui::PushItemWidth(hslider_width());
 
   int lfo_freq = patch.global.lfo_frequency;
 
@@ -202,7 +134,6 @@ void render_lfo_section(PatchEditorContext &context, ym2612::Patch &patch,
   track_patch_history(context, "LFO Frequency", "global.lfo_frequency");
   if (lfo_freq_changed) {
     patch.global.lfo_frequency = static_cast<uint8_t>(lfo_freq);
-    settings_changed = true;
   }
 
   ImGui::Spacing();
@@ -214,7 +145,6 @@ void render_lfo_section(PatchEditorContext &context, ym2612::Patch &patch,
                       "channel.am_sensitivity");
   if (ams_changed) {
     patch.channel.amplitude_modulation_sensitivity = static_cast<uint8_t>(ams);
-    settings_changed = true;
   }
 
   int fms = patch.channel.frequency_modulation_sensitivity;
@@ -224,7 +154,6 @@ void render_lfo_section(PatchEditorContext &context, ym2612::Patch &patch,
                       "channel.fm_sensitivity");
   if (fms_changed) {
     patch.channel.frequency_modulation_sensitivity = static_cast<uint8_t>(fms);
-    settings_changed = true;
   }
   if (!lfo_enable)
     ImGui::EndDisabled();
@@ -233,30 +162,29 @@ void render_lfo_section(PatchEditorContext &context, ym2612::Patch &patch,
   ImGui::Spacing();
 }
 
-void render_channel_section(PatchEditorContext &context, ym2612::Patch &patch,
-                            bool &settings_changed) {
+void render_channel_section(PatchEditorContext &context, ym2612::Patch &patch) {
   ImGui::SeparatorText("Channel");
   bool left_speaker = patch.channel.left_speaker;
   if (ImGui::Checkbox("Left Speaker", &left_speaker)) {
-    patch.channel.left_speaker = left_speaker;
-    settings_changed = true;
+    track_instant_patch_history(context, "Left Speaker", [&] {
+      patch.channel.left_speaker = left_speaker;
+    });
   }
-  track_patch_history(context, "Left Speaker", "channel.left_speaker");
 
   ImGui::SameLine();
 
   bool right_speaker = patch.channel.right_speaker;
   if (ImGui::Checkbox("Right Speaker", &right_speaker)) {
-    patch.channel.right_speaker = right_speaker;
-    settings_changed = true;
+    track_instant_patch_history(context, "Right Speaker", [&] {
+      patch.channel.right_speaker = right_speaker;
+    });
   }
-  track_patch_history(context, "Right Speaker", "channel.right_speaker");
 
-  ImGui::PushItemWidth(hslider_width);
+  ImGui::PushItemWidth(hslider_width());
 
   if (const auto *preview =
           get_algorithm_preview_texture(patch.instrument.algorithm)) {
-    ImGui::Image(preview->texture_id, preview->size);
+    ImGui::Image(preview->texture_id, ui::scale::px(preview->size));
   }
 
   int algorithm = patch.instrument.algorithm;
@@ -264,42 +192,129 @@ void render_channel_section(PatchEditorContext &context, ym2612::Patch &patch,
   track_patch_history(context, "Algorithm", "instrument.algorithm");
   if (algorithm_changed) {
     patch.instrument.algorithm = static_cast<uint8_t>(algorithm);
-    settings_changed = true;
   }
   ImGui::PopItemWidth();
 
   ImGui::Spacing();
 }
 
-void render_operator_section(PatchEditorContext &context, ym2612::Patch &patch,
-                             bool &settings_changed) {
+void render_operator_section(PatchEditorContext &context,
+                             ym2612::Patch &patch) {
 
   const auto avail_width = ImGui::GetContentRegionAvail().x;
   bool space_for_feedbacks[4] = {false};
-  if (avail_width > 250.0f * 4) {
+  const float column_min_width = ui::scale::px(250.0f);
+  if (avail_width > column_min_width * 4) {
     ImGui::Columns(4, "operation_columns", false);
     space_for_feedbacks[0] = true;
     space_for_feedbacks[1] = true;
     space_for_feedbacks[2] = true;
     space_for_feedbacks[3] = true;
-  } else if (avail_width > 250.0f * 2) {
+  } else if (avail_width > column_min_width * 2) {
     ImGui::Columns(2, "operation_columns", false);
     space_for_feedbacks[0] = true;
     space_for_feedbacks[1] = true;
   } else {
     ImGui::Columns(1, "operation_columns", false);
   }
-  for (auto i = 0; i < 4; i++) {
-    auto op_index = static_cast<int>(ym2612::all_operator_indices[i]);
 
-    settings_changed |= render_operator_editor(
-        context, patch, patch.instrument.operators[op_index], i,
-        context.envelope_states[i], space_for_feedbacks[i]);
+  // The four frames share one height so their borders line up; each operator
+  // reports what it needed and the tallest wins the next frame.
+  context.operator_edit.pending_frame_height = 0.0f;
+  context.operator_edit.click_claimed = false;
+  // Read once, so all four graphs draw the same instant -- and so the audio
+  // thread's publication is sampled once a frame rather than four times.
+  const EnvelopeVoices voices =
+      collect_envelope_voices(context.session.voice_activity());
+  for (int slot = 0; slot < 4; slot++) {
+    render_operator_editor(context, patch, slot, context.envelope_states[slot],
+                           space_for_feedbacks[slot], voices);
 
     ImGui::Spacing();
     ImGui::NextColumn();
   }
+  context.operator_edit.frame_height =
+      context.operator_edit.pending_frame_height;
   ImGui::Columns(1);
+}
+
+OperatorCommandContext make_operator_commands(PatchEditorContext &context,
+                                              ym2612::Patch &patch) {
+  return {patch.instrument, context.operator_edit,
+          [&context](const std::string &label) {
+            if (context.begin_history) {
+              // Empty merge key: two pastes in a row stay two undo steps.
+              context.begin_history(label, {}, context.session.current_patch());
+            }
+          },
+          [&context]() {
+            if (context.commit_history) {
+              context.commit_history();
+            }
+          }};
+}
+
+/**
+ * Copy, paste and swap while the patch editor has the keyboard.
+ *
+ * Gated on this window rather than handled globally: Ctrl+C in the patch
+ * browser belongs to the browser, and WantTextInput keeps it out of the
+ * search box and every other text field.
+ */
+void handle_operator_shortcuts(PatchEditorContext &context,
+                               ym2612::Patch &patch) {
+  const ImGuiIO &io = ImGui::GetIO();
+  if (io.WantTextInput ||
+      !ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
+    return;
+  }
+  if (!io.KeyCtrl && !io.KeySuper) {
+    return;
+  }
+
+  auto commands = make_operator_commands(context, patch);
+  if (io.KeyShift) {
+    if (ImGui::IsKeyPressed(ImGuiKey_X, false)) {
+      swap_operators_command(commands);
+    }
+    return;
+  }
+  if (ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+    copy_operator_command(commands);
+  } else if (ImGui::IsKeyPressed(ImGuiKey_V, false)) {
+    paste_operator_command(commands);
+  }
+}
+
+/**
+ * Escape, or a click that landed on nothing, drops the selection.
+ *
+ * Called after the operators are drawn so IsAnyItemHovered() already
+ * accounts for them: a click inside an operator is a click on something.
+ */
+void handle_operator_deselect(PatchEditorContext &context) {
+  auto &selection = context.operator_edit.selection;
+  if (selection.empty()) {
+    return;
+  }
+
+  const ImGuiIO &io = ImGui::GetIO();
+  if (!io.WantTextInput &&
+      ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+      ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+    selection.clear();
+    return;
+  }
+
+  // An operator's own background is not "nothing": the click that selected
+  // it looks exactly like a click on the window behind it, so the operators
+  // say when one was theirs.
+  if (!context.operator_edit.click_claimed &&
+      ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
+      ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+      !ImGui::IsAnyItemHovered() && !ImGui::IsAnyItemActive()) {
+    selection.clear();
+  }
 }
 
 } // namespace
@@ -310,38 +325,50 @@ void render_patch_editor(const char *title, PatchEditorContext &context,
   auto &patch = context.session.current_patch();
   auto is_modified = context.session.is_modified();
 
+  // The selection belongs to the patch it was made in, so loading another
+  // one -- or undoing a load back to the previous one -- drops it. Patch Lab
+  // results keep it: they replace the contents of the same slot, and the
+  // user is still working on the operators they picked. The clipboard is
+  // deliberately untouched, so an operator can be carried across.
+  const auto &selection_path = context.session.current_patch_selection_path();
+  if (context.operator_edit.selection_patch_path != selection_path) {
+    context.operator_edit.selection_patch_path = selection_path;
+    context.operator_edit.selection.clear();
+    context.operator_edit.baseline.clear();
+  }
+
   if (!context.prefs.show_patch_editor) {
     return;
   }
 
-  ImGui::SetNextWindowPos(ImVec2(400, 50), ImGuiCond_FirstUseEver);
-  ImGui::SetNextWindowSize(ImVec2(400, 600), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowPos(ui::scale::px(ImVec2(400, 50)),
+                          ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ui::scale::px(ImVec2(400, 600)),
+                           ImGuiCond_FirstUseEver);
 
-  auto title_with_id =
-      std::string(title) + (is_modified ? " *###" : "###") + std::string(title);
-  if (!ImGui::Begin(title_with_id.c_str(), &context.prefs.show_patch_editor)) {
-    ImGui::End();
-    return;
-  }
+  auto title_with_id = patch_editor_window_title(
+      title, context.session.current_patch_path(), is_modified);
+  // Match the waveform panel: no tab bar while this window is docked alone.
+  ImGuiWindowClass window_class;
+  window_class.DockNodeFlagsOverrideSet = ImGuiDockNodeFlags_AutoHideTabBar;
+  ImGui::SetNextWindowClass(&window_class);
+  if (ImGui::Begin(title_with_id.c_str(), &context.prefs.show_patch_editor)) {
+    render_patch_metadata(context, state);
 
-  bool settings_changed = false;
-
-  render_patch_metadata(context, patch, state);
-
-  const auto available_width = ImGui::GetContentRegionAvail().x;
-  ImGui::Columns(available_width > 800 ? 2 : 1, "##lfo_channel_columns", false);
-  render_lfo_section(context, patch, settings_changed);
-  ImGui::NextColumn();
-  render_channel_section(context, patch, settings_changed);
-  ImGui::Columns(1);
-  render_operator_section(context, patch, settings_changed);
-
-  // Apply settings if changed
-  if (settings_changed) {
-    context.session.apply_patch_to_audio();
+    const auto available_width = ImGui::GetContentRegionAvail().x;
+    ImGui::Columns(available_width > ui::scale::px(800.0f) ? 2 : 1,
+                   "##lfo_channel_columns", false);
+    render_lfo_section(context, patch);
+    ImGui::NextColumn();
+    render_channel_section(context, patch);
+    ImGui::Columns(1);
+    render_operator_section(context, patch);
+    handle_operator_deselect(context);
+    handle_operator_shortcuts(context, patch);
   }
 
   ImGui::End();
+  context.session.apply_patch_to_audio_if_changed();
 }
 
 } // namespace ui

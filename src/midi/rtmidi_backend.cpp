@@ -33,7 +33,7 @@ bool RtMidiBackend::initialize() {
 
 void RtMidiBackend::shutdown() {
   for (auto &connection : connections_) {
-    close_connection(connection);
+    close_connection(*connection);
   }
   connections_.clear();
   enumerator_.reset();
@@ -54,8 +54,14 @@ void RtMidiBackend::poll(std::vector<MidiMessage> &events,
   }
 
   try {
-    handle_port_changes();
-    collect_events(events);
+    // Asking the OS for the port list is not free (CoreMIDI and WinMM both
+    // allocate), and hotplug is a human-timescale event -- once a second is
+    // plenty. Notes are unaffected; they arrive through per-port callbacks.
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= next_enumeration_) {
+      next_enumeration_ = now + std::chrono::seconds(1);
+      handle_port_changes();
+    }
 
     if (ports_dirty_) {
       available_ports = available_ports_;
@@ -90,6 +96,8 @@ std::vector<std::string> RtMidiBackend::enumerate_ports() {
 void RtMidiBackend::close_connection(Connection &connection) {
   if (connection.midi_in && connection.midi_in->isPortOpen()) {
     std::cout << "Closing MIDI input port: " << connection.port_name << "\n";
+    // Stop the callback before the Connection it points at goes away.
+    connection.midi_in->cancelCallback();
     connection.midi_in->closePort();
   }
 }
@@ -121,8 +129,16 @@ bool RtMidiBackend::open_connection(const std::string &port_name) {
 
   try {
     midi->openPort(static_cast<unsigned int>(matched_index));
-    midi->ignoreTypes(false, false, false);
-    connections_.push_back(Connection{std::move(midi), {}, port_name});
+    midi->ignoreTypes(true, true, true);
+    // The Connection has to be in place before the callback can fire, and it
+    // must not move afterwards -- hence unique_ptr elements.
+    auto connection = std::make_unique<Connection>();
+    connection->port_name = port_name;
+    connection->backend = this;
+    connection->midi_in = std::move(midi);
+    connection->midi_in->setCallback(&RtMidiBackend::handle_message,
+                                     connection.get());
+    connections_.push_back(std::move(connection));
     std::cout << "Opened MIDI input port: " << port_name << "\n";
     return true;
   } catch (RtMidiError &error) {
@@ -134,9 +150,10 @@ bool RtMidiBackend::open_connection(const std::string &port_name) {
 
 void RtMidiBackend::sync_connections(const std::vector<std::string> &ports) {
   for (auto it = connections_.begin(); it != connections_.end();) {
-    if (std::find(ports.begin(), ports.end(), it->port_name) == ports.end()) {
-      std::cout << "MIDI input disconnected: " << it->port_name << "\n";
-      close_connection(*it);
+    if (std::find(ports.begin(), ports.end(), (*it)->port_name) ==
+        ports.end()) {
+      std::cout << "MIDI input disconnected: " << (*it)->port_name << "\n";
+      close_connection(**it);
       it = connections_.erase(it);
     } else {
       ++it;
@@ -144,9 +161,11 @@ void RtMidiBackend::sync_connections(const std::vector<std::string> &ports) {
   }
 
   for (const auto &port : ports) {
-    const bool already_open = std::any_of(
-        connections_.begin(), connections_.end(),
-        [&](const Connection &conn) { return conn.port_name == port; });
+    const bool already_open =
+        std::any_of(connections_.begin(), connections_.end(),
+                    [&](const std::unique_ptr<Connection> &conn) {
+                      return conn->port_name == port;
+                    });
 
     if (!already_open) {
       std::cout << "MIDI input connected: " << port << "\n";
@@ -159,15 +178,20 @@ void RtMidiBackend::handle_port_changes() {
   auto ports = enumerate_ports();
 
   const bool had_ports = !available_ports_.empty();
-  available_ports_ = std::move(ports);
-  ports_dirty_ = true;
+  if (ports != available_ports_) {
+    available_ports_ = std::move(ports);
+    ports_dirty_ = true;
+  } else if (ports.empty()) {
+    // Nothing changed and nothing to manage.
+    return;
+  }
 
   if (available_ports_.empty()) {
     if (had_ports) {
       for (auto &connection : connections_) {
-        std::cout << "MIDI input disconnected: " << connection.port_name
+        std::cout << "MIDI input disconnected: " << connection->port_name
                   << "\n";
-        close_connection(connection);
+        close_connection(*connection);
       }
       connections_.clear();
     }
@@ -183,44 +207,48 @@ void RtMidiBackend::handle_port_changes() {
   sync_connections(available_ports_);
 }
 
-void RtMidiBackend::collect_events(std::vector<MidiMessage> &events) {
-  if (connections_.empty()) {
+void RtMidiBackend::handle_message(double, std::vector<unsigned char> *message,
+                                   void *user_data) {
+  // Runs on RtMidi's own thread, one per open port. Notes go straight to the
+  // sink instead of waiting to be picked up by the next rendered frame.
+  auto *connection = static_cast<Connection *>(user_data);
+  if (connection == nullptr || connection->backend == nullptr ||
+      message == nullptr || message->size() < 2) {
     return;
   }
 
-  for (auto &connection : connections_) {
-    while (true) {
-      connection.message.clear();
-      double stamp = connection.midi_in->getMessage(&connection.message);
-      (void)stamp;
+  const std::uint8_t status = (*message)[0];
+  const std::uint8_t status_type = status & 0xF0;
+  const std::uint8_t data1 = (*message)[1] & 0x7f;
+  const std::uint8_t data2 =
+      (message->size() >= 3) ? ((*message)[2] & 0x7f) : 0;
 
-      if (connection.message.empty()) {
-        break;
-      }
+  const bool is_note_off =
+      status_type == 0x80 || (status_type == 0x90 && data2 == 0);
+  const bool is_note_on = status_type == 0x90 && data2 > 0;
 
-      if (connection.message.size() < 2) {
-        continue;
-      }
+  MidiMessage event;
+  event.port_name = connection->port_name;
 
-      const std::uint8_t status = connection.message[0];
-      const std::uint8_t status_type = status & 0xF0;
-      const std::uint8_t midi_note_value = connection.message[1];
-      const std::uint8_t velocity =
-          (connection.message.size() >= 3) ? connection.message[2] : 0;
-
-      const auto note = ym2612::Note::from_midi_note(midi_note_value);
-
-      const bool is_note_off =
-          status_type == 0x80 || (status_type == 0x90 && velocity == 0);
-      const bool is_note_on = status_type == 0x90 && velocity > 0;
-
-      if (is_note_on) {
-        events.push_back(
-            {MidiMessage::Type::NoteOn, note, velocity, connection.port_name});
-      } else if (is_note_off) {
-        events.push_back(
-            {MidiMessage::Type::NoteOff, note, velocity, connection.port_name});
-      }
-    }
+  if (is_note_on) {
+    event.type = MidiMessage::Type::NoteOn;
+    event.note = ym2612::Note::from_midi_note(data1);
+    event.velocity = data2;
+    connection->backend->emit(event);
+  } else if (is_note_off) {
+    event.type = MidiMessage::Type::NoteOff;
+    event.note = ym2612::Note::from_midi_note(data1);
+    event.velocity = data2;
+    connection->backend->emit(event);
+  } else if (status_type == 0xe0 && message->size() >= 3) {
+    event.type = MidiMessage::Type::PitchBend;
+    event.pitch_bend =
+        static_cast<uint16_t>(data1 | (static_cast<uint16_t>(data2) << 7));
+    connection->backend->emit(event);
+  } else if (status_type == 0xb0 && message->size() >= 3) {
+    event.type = MidiMessage::Type::ControlChange;
+    event.controller = data1;
+    event.controller_value = data2;
+    connection->backend->emit(event);
   }
 }

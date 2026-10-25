@@ -11,6 +11,18 @@
 
 namespace ui {
 
+namespace {
+
+// Versioned so a stored layout from a build whose default panel set differed
+// is discarded once, instead of pinning users to a layout that has no place
+// for a window that now exists. Bump this whenever the default layout gains
+// or loses a panel.
+constexpr const char *kLayoutKey = "megatoy_imgui_ini_v3";
+constexpr const char *kPreviousLayoutKeys[] = {"megatoy_imgui_ini",
+                                               "megatoy_imgui_ini_v2"};
+
+} // namespace
+
 void sync_web_imgui_ini(bool &first_frame, bool &web_ini_loaded,
                         bool &layout_loaded) {
   if (web_ini_loaded) {
@@ -19,7 +31,13 @@ void sync_web_imgui_ini(bool &first_frame, bool &web_ini_loaded,
   if (ImGui::GetCurrentContext() == nullptr) {
     return;
   }
-  auto stored = platform::web::read_local_storage("megatoy_imgui_ini");
+  // Layouts saved before a panel existed on web have no node for it, so it
+  // would come back floating. Drop them and rebuild the default.
+  for (const char *key : kPreviousLayoutKeys) {
+    platform::web::remove_local_storage(key);
+  }
+
+  auto stored = platform::web::read_local_storage(kLayoutKey);
   if (stored.has_value() && !stored->empty()) {
     ImGui::LoadIniSettingsFromMemory(stored->c_str(), stored->size());
     first_frame = false;
@@ -49,10 +67,9 @@ void save_web_imgui_ini_if_needed(bool &web_ini_loaded) {
     const bool first_save = last_save_time == 0.0;
     const bool throttle_ok = first_save || (now - last_save_time) > 1.0;
     if (current != last_saved && throttle_ok) {
-      const bool ok =
-          platform::web::write_local_storage("megatoy_imgui_ini", current);
-      (void)ok;
-      last_saved = current;
+      if (platform::web::write_local_storage(kLayoutKey, current)) {
+        last_saved = current;
+      }
       last_save_time = now;
     }
   }

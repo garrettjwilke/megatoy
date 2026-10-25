@@ -5,33 +5,6 @@ include(FetchContent)
 if(NOT EMSCRIPTEN)
   find_package(OpenGL REQUIRED)
   find_package(CURL REQUIRED)
-else()
-  if(DEFINED ENV{EM_CACHE} AND NOT "$ENV{EM_CACHE}" STREQUAL "")
-    set(_ems_sysroot "$ENV{EM_CACHE}/sysroot")
-  elseif(DEFINED CMAKE_SYSROOT AND NOT CMAKE_SYSROOT STREQUAL "")
-    set(_ems_sysroot "${CMAKE_SYSROOT}")
-  elseif(DEFINED EMSCRIPTEN_ROOT_PATH)
-    set(_ems_sysroot "${EMSCRIPTEN_ROOT_PATH}/cache/sysroot")
-  elseif(DEFINED ENV{EMSDK})
-    set(_ems_sysroot "$ENV{EMSDK}/upstream/emscripten/cache/sysroot")
-  else()
-    message(FATAL_ERROR "Unable to determine Emscripten sysroot for zlib.")
-  endif()
-  if(NOT EXISTS "${_ems_sysroot}/lib/wasm32-emscripten/libz.a")
-    find_program(EMBUILDER_EXECUTABLE embuilder)
-    if(EMBUILDER_EXECUTABLE)
-      execute_process(COMMAND "${EMBUILDER_EXECUTABLE}" build zlib)
-    else()
-      message(WARNING "embuilder not found; zlib may be unavailable for Emscripten builds.")
-    endif()
-  endif()
-  set(ZLIB_LIBRARY "${_ems_sysroot}/lib/wasm32-emscripten/libz.a" CACHE FILEPATH "" FORCE)
-  set(ZLIB_LIBRARIES "${ZLIB_LIBRARY}" CACHE FILEPATH "" FORCE)
-  set(ZLIB_INCLUDE_DIR "${_ems_sysroot}/include" CACHE PATH "" FORCE)
-  set(ZLIB_INCLUDE_DIRS "${ZLIB_INCLUDE_DIR}" CACHE PATH "" FORCE)
-  set(MEGATOY_EMSCRIPTEN_SYSROOT "${_ems_sysroot}" CACHE PATH "" FORCE)
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -sUSE_ZLIB=1")
-  set(ZLIB_FOUND TRUE CACHE BOOL "" FORCE)
 endif()
 
 # nlohmann_json
@@ -47,7 +20,7 @@ if(NOT EMSCRIPTEN)
   FetchContent_Declare(
     nfd
     GIT_REPOSITORY https://github.com/btzy/nativefiledialog-extended
-    GIT_TAG        v1.2.1
+    GIT_TAG        v1.3.0
   )
   set(NFD_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(nfd)
@@ -57,7 +30,7 @@ endif()
 FetchContent_Declare(
   SDL3
   GIT_REPOSITORY https://github.com/libsdl-org/SDL
-  GIT_TAG        release-3.2.26
+  GIT_TAG        release-3.4.12
 )
 FetchContent_MakeAvailable(SDL3)
 
@@ -65,39 +38,42 @@ FetchContent_MakeAvailable(SDL3)
 FetchContent_Declare(
   imgui
   GIT_REPOSITORY https://github.com/ocornut/imgui
-  GIT_TAG        docking
+  # The docking feature lives on its own branch; -docking tags are its
+  # releases. Pinned rather than tracking the branch so a build is
+  # reproducible and an upstream change cannot break CI unannounced.
+  GIT_TAG        v1.92.9-docking
 )
 FetchContent_MakeAvailable(imgui)
 
-# libvgm
+# ymfm - YM2612 emulation core.
+# ymfm ships no CMake project, so only the sources are fetched; the library
+# target is defined in cmake/targets.cmake.
 FetchContent_Declare(
-  libvgm
-  GIT_REPOSITORY https://github.com/ValleyBell/libvgm
-  GIT_TAG        e9f2b023e8918b56be0d2e634b3f5aab2a589ffe
+  ymfm
+  GIT_REPOSITORY https://github.com/aaronsgiles/ymfm
+  GIT_TAG        17decfae857b92ab55fbb30ade2287ace095a381
 )
-if(WIN32)
-  set(LIBRARY_TYPE STATIC CACHE STRING "" FORCE)
-  set(BUILD_PLAYER OFF CACHE BOOL "" FORCE)
-  set(BUILD_VGM2WAV OFF CACHE BOOL "" FORCE)
-  set(LINK_STATIC_LIBS ON CACHE BOOL "" FORCE)
-  set(USE_SANITIZERS OFF CACHE BOOL "" FORCE)
-  set(UTIL_CHARCNV_ICONV OFF CACHE BOOL "" FORCE)
-  set(UTIL_CHARCNV_WINAPI ON CACHE BOOL "" FORCE)
-  set(_LIBVGM_FETCH_ROOT "${CMAKE_BINARY_DIR}/_deps/libvgm-src")
-  set(ZLIB_ROOT "${_LIBVGM_FETCH_ROOT}/libs" CACHE PATH "" FORCE)
-  set(ZLIB_INCLUDE_DIR "${_LIBVGM_FETCH_ROOT}/libs/include" CACHE PATH "" FORCE)
-  set(ZLIB_INCLUDE_DIRS "${_LIBVGM_FETCH_ROOT}/libs/include" CACHE PATH "" FORCE)
-  set(ZLIB_LIBRARY "${_LIBVGM_FETCH_ROOT}/libs/lib/zlib64.lib" CACHE FILEPATH "" FORCE)
-  set(ZLIB_LIBRARIES "${_LIBVGM_FETCH_ROOT}/libs/lib/zlib64.lib" CACHE FILEPATH "" FORCE)
-  set(ZLIB_LIBRARY_RELEASE "${_LIBVGM_FETCH_ROOT}/libs/lib/zlib64.lib" CACHE FILEPATH "" FORCE)
-  set(ZLIB_LIBRARY_DEBUG "${_LIBVGM_FETCH_ROOT}/libs/lib/zlib64d.lib" CACHE FILEPATH "" FORCE)
+if(POLICY CMP0169)
+  cmake_policy(SET CMP0169 OLD)
 endif()
-set(BUILD_LIBAUDIO OFF CACHE BOOL "" FORCE)
-set(BUILD_PLAYER OFF CACHE BOOL "" FORCE)
-set(BUILD_VGM2WAV OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(USE_SANITIZERS OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(libvgm)
+FetchContent_GetProperties(ymfm)
+if(NOT ymfm_POPULATED)
+  FetchContent_Populate(ymfm)
+endif()
+
+# Nuked-OPN2 - YM2612 emulation core.
+# Plain C and no CMake project, so only the sources are fetched; the library
+# target is defined in cmake/targets.cmake. The repository publishes no tags,
+# so the pin below is a commit SHA.
+FetchContent_Declare(
+  nuked_opn2
+  GIT_REPOSITORY https://github.com/nukeykt/Nuked-OPN2
+  GIT_TAG        335747d78cb0abbc3b55b004e62dad9763140115
+)
+FetchContent_GetProperties(nuked_opn2)
+if(NOT nuked_opn2_POPULATED)
+  FetchContent_Populate(nuked_opn2)
+endif()
 
 if(NOT EMSCRIPTEN)
   # RtMidi
@@ -111,14 +87,29 @@ if(NOT EMSCRIPTEN)
   set(RTMIDI_BUILD_TESTING OFF CACHE BOOL "" FORCE)
   set(RTMIDI_TARGETNAME_UNINSTALL rtmidi_uninstall CACHE STRING "" FORCE)
   FetchContent_MakeAvailable(rtmidi)
+
+  # SQLiteCpp is kept native-only for the one-time import of metadata written
+  # by pre-workspace releases. The browser never created that database.
+  FetchContent_Declare(
+    SQLiteCpp
+    GIT_REPOSITORY https://github.com/SRombauts/SQLiteCpp.git
+    GIT_TAG        3.3.1
+  )
+  set(SQLITECPP_INTERNAL_SQLITE ON CACHE BOOL "" FORCE)
+  set(SQLITECPP_RUN_CPPLINT OFF CACHE BOOL "" FORCE)
+  set(SQLITECPP_RUN_CPPCHECK OFF CACHE BOOL "" FORCE)
+  set(SQLITECPP_RUN_DOXYGEN OFF CACHE BOOL "" FORCE)
+  set(SQLITECPP_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(SQLITECPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(SQLiteCpp)
 endif()
 
 # stb single-header image loader
 FetchContent_Declare(
   stb
   GIT_REPOSITORY https://github.com/nothings/stb.git
-  GIT_TAG        master
-  GIT_SHALLOW    TRUE
+  # stb publishes no releases; pinned to a known-good commit.
+  GIT_TAG        31c1ad37456438565541f4919958214b6e762fb4
 )
 FetchContent_MakeAvailable(stb)
 
@@ -134,7 +125,7 @@ FetchContent_MakeAvailable(chord_detector)
 FetchContent_Declare(
   kissfft
   GIT_REPOSITORY https://github.com/mborgerding/kissfft.git
-  GIT_TAG        master
+  GIT_TAG        131.2.0
 )
 set(KISSFFT_STATIC ON CACHE BOOL "" FORCE)
 set(KISSFFT_SHARED OFF CACHE BOOL "" FORCE)
@@ -144,50 +135,50 @@ set(KISSFFT_TOOLS    OFF CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(kissfft)
 
-if(NOT EMSCRIPTEN)
-  # SQLiteCpp
-  FetchContent_Declare(
-    SQLiteCpp
-    GIT_REPOSITORY https://github.com/SRombauts/SQLiteCpp.git
-    GIT_TAG        3.3.1
-  )
-  set(SQLITECPP_INTERNAL_SQLITE ON CACHE BOOL "" FORCE)
-  set(SQLITECPP_RUN_CPPLINT OFF CACHE BOOL "" FORCE)
-  set(SQLITECPP_RUN_CPPCHECK OFF CACHE BOOL "" FORCE)
-  set(SQLITECPP_RUN_DOXYGEN OFF CACHE BOOL "" FORCE)
-  set(SQLITECPP_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-  set(SQLITECPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-  FetchContent_MakeAvailable(SQLiteCpp)
-endif()
-
 # FontAwesome Headers
 FetchContent_Declare(
   IconFontCppHeaders
   GIT_REPOSITORY https://github.com/juliettef/IconFontCppHeaders.git
-  GIT_TAG        main
+  # No releases upstream; pinned to a known-good commit.
+  GIT_TAG        210b5a399a64270674560d633638952d1e8d804d
 )
 FetchContent_MakeAvailable(IconFontCppHeaders)
 
+# ym2612_format - patch file readers and writers.
+# It vendors miniz (third_party/miniz amalgamation) as a `miniz` target, which
+# megatoy uses directly for .ginpkg packaging.
 FetchContent_Declare(
-  miniz
-  GIT_REPOSITORY https://github.com/richgel999/miniz
-  GIT_TAG        2.2.0
+  ym2612_format
+  GIT_REPOSITORY https://github.com/ulalume/ym2612_format
+  GIT_TAG        v0.3.1
 )
-if(POLICY CMP0169)
-  cmake_policy(SET CMP0169 OLD)
-endif()
-FetchContent_GetProperties(miniz)
-if(NOT miniz_POPULATED)
-  FetchContent_Populate(miniz)
-  set(miniz_export_header "${miniz_SOURCE_DIR}/miniz_export.h")
-  if(NOT EXISTS "${miniz_export_header}")
-    file(WRITE "${miniz_export_header}" "#pragma once\n\n#if defined(_WIN32)\n#if defined(MINIZ_SHARED)\n#if defined(MINIZ_EXPORTS)\n#define MINIZ_EXPORT __declspec(dllexport)\n#else\n#define MINIZ_EXPORT __declspec(dllimport)\n#endif\n#else\n#define MINIZ_EXPORT\n#endif\n#elif defined(__GNUC__) && __GNUC__ >= 4\n#define MINIZ_EXPORT __attribute__((visibility(\"default\")))\n#else\n#define MINIZ_EXPORT\n#endif\n")
-  endif()
-endif()
-add_library(miniz STATIC
-  ${miniz_SOURCE_DIR}/miniz.c
-  ${miniz_SOURCE_DIR}/miniz_tdef.c
-  ${miniz_SOURCE_DIR}/miniz_tinfl.c
-  ${miniz_SOURCE_DIR}/miniz_zip.c
+set(YM2612_FORMAT_BUILD_CLI OFF CACHE BOOL "" FORCE)
+set(YM2612_FORMAT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(ym2612_format)
+
+# ym2612_eg - sample-accurate envelope generator simulator, header-only.
+# Drives the envelope graph; it is a visualisation model, not an audio path.
+FetchContent_Declare(
+  ym2612_eg
+  GIT_REPOSITORY https://github.com/ulalume/ym2612_eg.git
+  GIT_TAG        v0.7.1
 )
-target_include_directories(miniz PUBLIC ${miniz_SOURCE_DIR})
+set(YM2612_EG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(YM2612_EG_BUILD_BENCH OFF CACHE BOOL "" FORCE)
+set(YM2612_EG_BUILD_GOLDEN_GEN OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(ym2612_eg)
+
+# ym2612-patches - the built-in CC0 preset library. Data only (LICENSE,
+# .gitignore, *.dmp files); it ships no CMakeLists.txt, so
+# FetchContent_MakeAvailable just populates ym2612_patches_SOURCE_DIR instead
+# of add_subdirectory()-ing it. The repo publishes no tags, so the pin below
+# is a commit SHA -- bumping that SHA is the entire follow-upstream
+# procedure. For offline/local development, override with
+# FETCHCONTENT_SOURCE_DIR_YM2612_PATCHES (dev-only, never committed; same
+# policy as the other dependency overrides).
+FetchContent_Declare(
+  ym2612_patches
+  GIT_REPOSITORY https://github.com/ulalume/ym2612-patches.git
+  GIT_TAG        6422f9a1842acbe6ed01a4f8a62cec93cf2199e2
+)
+FetchContent_MakeAvailable(ym2612_patches)

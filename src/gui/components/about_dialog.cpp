@@ -1,5 +1,9 @@
 #include "about_dialog.hpp"
 
+#include "changelog_dialog.hpp"
+#include "common.hpp"
+#include "modal.hpp"
+
 #include "gui/styles/megatoy_style.hpp"
 #include "platform/platform_config.hpp"
 #include "project_info.hpp"
@@ -140,13 +144,18 @@ void render_update_status(const AboutModalState &state) {
 void render_about_dialog() {
   auto &state = about_modal_state();
   poll_update_request(state);
-  ImGui::SetNextWindowSize(ImVec2(350, -1));
-  if (!ImGui::BeginPopupModal("About megatoy", nullptr,
-                              ImGuiWindowFlags_AlwaysAutoResize)) {
+  // Nothing here is a decision, so anything that means "I am done looking"
+  // closes it.
+  auto scope =
+      begin_modal("About megatoy", ModalDismiss::EscapeOrOutsideClick, 350.0f);
+  if (!scope.visible) {
     if (!ImGui::IsPopupOpen("About megatoy")) {
       state.reset();
     }
     return;
+  }
+  if (scope.dismissed) {
+    state.reset();
   }
 
   if (ImGui::IsWindowAppearing()) {
@@ -154,6 +163,12 @@ void render_about_dialog() {
   }
 
   ImGui::Text("Version: %s", megatoy::kVersionTag);
+  ImGui::SameLine();
+  if (ImGui::TextLink("Change log")) {
+    state.reset();
+    ImGui::CloseCurrentPopup();
+    open_changelog_dialog();
+  }
 
 #if defined(MEGATOY_PLATFORM_WEB)
   ImGui::Spacing();
@@ -175,12 +190,13 @@ void render_about_dialog() {
 #endif
 
   ImGui::Separator();
-  if (ImGui::Button("OK", ImVec2(120.0f, 0.0f))) {
+  align_buttons_right({dialog_button_width()});
+  if (ImGui::Button("OK", ImVec2(dialog_button_width(), 0.0f))) {
     state.reset();
     ImGui::CloseCurrentPopup();
   }
 
-  ImGui::EndPopup();
+  end_modal();
 }
 
 void open_about_dialog() { ImGui::OpenPopup("About megatoy"); }

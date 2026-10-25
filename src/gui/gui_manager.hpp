@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gui/styles/theme.hpp"
+#include "gui/ui_scale.hpp"
 #include "preferences/preference_manager.hpp"
 #include <string>
 
@@ -63,9 +64,13 @@ public:
   void end_frame();
 
   /**
-   * Poll events
+   * Wait up to `timeout_ms` for an event, then drain the SDL queue.
+   * Returns immediately when input arrives so an idle frame cap adds no
+   * interaction latency.
    */
-  void poll_events();
+  bool poll_events(int timeout_ms = 0);
+
+  bool is_minimized() const;
 
   /**
    * Get SDL window pointer
@@ -96,14 +101,20 @@ public:
 
   bool supports_fullscreen() const;
   bool supports_quit() const;
-  bool supports_waveform() const;
-  bool supports_patch_history() const;
 
   /**
    * Theme management
    */
   void set_theme(ui::styles::ThemeId theme);
   ui::styles::ThemeId theme() const { return theme_; }
+
+  /**
+   * Interface scale
+   */
+  /// Rebuild the style for a scale preference; 0 follows the display.
+  void apply_ui_scale(float preference);
+  /// Enlargement the display asks content for; 1.0 when it cannot be read.
+  float display_scale() const;
 
   /**
    * File drop callback management
@@ -138,12 +149,15 @@ private:
   bool pending_imgui_ini_update_;
   std::string imgui_ini_file_path_;
   ui::styles::ThemeId theme_;
+  float ui_scale_preference_ = ui::scale::kAuto;
+  float ui_scale_ = 1.0f;
   bool web_layout_loaded_ = false;
 
   // Internal methods
   void set_imgui_ini_file(const std::string &path);
   void apply_imgui_ini_binding();
   void dispatch_drop_event(const char *path);
+  void process_event(const SDL_Event &event);
   void setup_default_layout(unsigned int dockspace_id);
 
   // Drop callback state

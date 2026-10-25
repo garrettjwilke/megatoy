@@ -1,3 +1,4 @@
+#include "audio/load_meter.hpp"
 #include "platform/platform_config.hpp"
 #include "preference_storage.hpp"
 #include <algorithm>
@@ -53,8 +54,64 @@ public:
         (*stream) >> j;
       }
 
-      if (j.contains("data_directory")) {
-        data.data_directory = j["data_directory"].get<std::string>();
+      data.legacy_workspace_migration_complete =
+          j.value("legacy_workspace_migration", 0) >= 1;
+      data.legacy_metadata_migration_complete =
+          j.value("legacy_metadata_migration", 0) >= 1;
+
+      const bool has_workspace_folders =
+          j.contains("workspace_folders") && j["workspace_folders"].is_array();
+      if (has_workspace_folders) {
+        data.workspace_folders.clear();
+        for (const auto &entry : j["workspace_folders"]) {
+          if (entry.is_string()) {
+            data.workspace_folders.emplace_back(entry.get<std::string>());
+          }
+        }
+      }
+
+#if !defined(MEGATOY_PLATFORM_WEB)
+      // Before workspaces, data_directory/patches was the repository root and
+      // data_directory/patches/user was its save directory. Adopt that tree as
+      // one workspace on first run; files stay exactly where they are.
+      if (!data.legacy_workspace_migration_complete &&
+          data.workspace_folders.empty() && j.contains("data_directory") &&
+          j["data_directory"].is_string()) {
+        const std::filesystem::path legacy_root =
+            j["data_directory"].get<std::string>();
+        if (!legacy_root.empty()) {
+          const auto patches_root = legacy_root / "patches";
+          data.workspace_folders = {patches_root};
+          data.legacy_metadata_workspace = patches_root;
+          data.migrated_legacy_workspace = true;
+        }
+      }
+
+      // Keep the exact old root available to the independent metadata
+      // migration even when the workspace list was already populated.
+      if (!data.legacy_metadata_migration_complete &&
+          data.legacy_metadata_workspace.empty() &&
+          j.contains("data_directory") && j["data_directory"].is_string()) {
+        const std::filesystem::path legacy_root =
+            j["data_directory"].get<std::string>();
+        if (!legacy_root.empty()) {
+          data.legacy_metadata_workspace = legacy_root / "patches";
+        }
+      }
+#endif
+
+      if (j.contains("last_save_directory")) {
+        data.last_save_directory = j["last_save_directory"].get<std::string>();
+      }
+      if (j.contains("last_patch_path")) {
+        data.last_patch_path = j["last_patch_path"].get<std::string>();
+      }
+      if (j.contains("last_seen_version")) {
+        data.last_seen_version = j["last_seen_version"].get<std::string>();
+      }
+
+      if (j.contains("show_builtin_presets")) {
+        data.show_builtin_presets = j["show_builtin_presets"].get<bool>();
       }
 
       if (j.contains("theme")) {
@@ -95,16 +152,38 @@ public:
         if (ui.contains("show_patch_lab")) {
           data.ui_preferences.show_patch_lab = ui["show_patch_lab"].get<bool>();
         }
-        if (ui.contains("show_patch_history")) {
-          data.ui_preferences.show_patch_history =
-              ui["show_patch_history"].get<bool>();
+        if (ui.contains("ym2612_chip_type")) {
+          data.ui_preferences.ym2612_chip_type =
+              std::clamp(ui["ym2612_chip_type"].get<int>(), 0, 1);
+        }
+        if (ui.contains("ym2612_core")) {
+          data.ui_preferences.ym2612_core =
+              std::clamp(ui["ym2612_core"].get<int>(), 0, 1);
+        }
+        if (ui.contains("audio_buffer_frames")) {
+          data.ui_preferences.audio_buffer_frames =
+              ui["audio_buffer_frames"].get<int>();
+        }
+        if (ui.contains("audio_load_reading")) {
+          data.ui_preferences.audio_load_reading =
+              static_cast<int>(audio::load_reading_from_int(
+                  ui["audio_load_reading"].get<int>()));
+        }
+        if (ui.contains("ui_scale")) {
+          data.ui_preferences.ui_scale = ui["ui_scale"].get<float>();
         }
         if (ui.contains("use_velocity")) {
           data.ui_preferences.use_velocity = ui["use_velocity"].get<bool>();
         }
-        if (ui.contains("patch_search_query")) {
-          data.ui_preferences.patch_search_query =
-              ui["patch_search_query"].get<std::string>();
+        if (ui.contains("use_pitch_bend")) {
+          data.ui_preferences.use_pitch_bend = ui["use_pitch_bend"].get<bool>();
+        }
+        if (ui.contains("use_mod_wheel")) {
+          data.ui_preferences.use_mod_wheel = ui["use_mod_wheel"].get<bool>();
+        }
+        if (ui.contains("velocity_sensitivity_depth")) {
+          data.ui_preferences.velocity_sensitivity_depth =
+              std::clamp(ui["velocity_sensitivity_depth"].get<int>(), 0, 100);
         }
         if (ui.contains("patch_sort_column")) {
           data.ui_preferences.patch_sort_column =
@@ -117,6 +196,14 @@ public:
         if (ui.contains("steal_oldest_note_when_full")) {
           data.ui_preferences.steal_oldest_note_when_full =
               ui["steal_oldest_note_when_full"].get<bool>();
+        }
+        if (ui.contains("multi_operator_edit_absolute")) {
+          data.ui_preferences.multi_operator_edit_absolute =
+              ui["multi_operator_edit_absolute"].get<bool>();
+        }
+        if (ui.contains("envelope_reference_midi_note")) {
+          data.ui_preferences.envelope_reference_midi_note =
+              ui["envelope_reference_midi_note"].get<int>();
         }
         if (ui.contains("midi_keyboard_scale")) {
           data.ui_preferences.midi_keyboard_scale =
@@ -170,7 +257,19 @@ public:
   bool save(const PreferenceData &data) override {
     try {
       nlohmann::json j;
-      j["data_directory"] = data.data_directory.string();
+      j["legacy_workspace_migration"] =
+          data.legacy_workspace_migration_complete ? 1 : 0;
+      j["legacy_metadata_migration"] =
+          data.legacy_metadata_migration_complete ? 1 : 0;
+      nlohmann::json folders = nlohmann::json::array();
+      for (const auto &folder : data.workspace_folders) {
+        folders.push_back(folder.string());
+      }
+      j["workspace_folders"] = std::move(folders);
+      j["last_save_directory"] = data.last_save_directory.string();
+      j["last_patch_path"] = data.last_patch_path;
+      j["last_seen_version"] = data.last_seen_version;
+      j["show_builtin_presets"] = data.show_builtin_presets;
       j["theme"] = ui::styles::storage_key(data.theme);
 
       nlohmann::json ui;
@@ -181,12 +280,23 @@ public:
       ui["show_mml_console"] = data.ui_preferences.show_mml_console;
       ui["show_preferences"] = data.ui_preferences.show_preferences;
       ui["show_patch_lab"] = data.ui_preferences.show_patch_lab;
-      ui["show_patch_history"] = data.ui_preferences.show_patch_history;
       ui["show_wave_viewer"] = data.ui_preferences.show_waveform;
+      ui["ym2612_chip_type"] = data.ui_preferences.ym2612_chip_type;
+      ui["ym2612_core"] = data.ui_preferences.ym2612_core;
+      ui["audio_buffer_frames"] = data.ui_preferences.audio_buffer_frames;
+      ui["audio_load_reading"] = data.ui_preferences.audio_load_reading;
+      ui["ui_scale"] = data.ui_preferences.ui_scale;
       ui["use_velocity"] = data.ui_preferences.use_velocity;
+      ui["use_pitch_bend"] = data.ui_preferences.use_pitch_bend;
+      ui["use_mod_wheel"] = data.ui_preferences.use_mod_wheel;
+      ui["velocity_sensitivity_depth"] =
+          data.ui_preferences.velocity_sensitivity_depth;
       ui["steal_oldest_note_when_full"] =
           data.ui_preferences.steal_oldest_note_when_full;
-      ui["patch_search_query"] = data.ui_preferences.patch_search_query;
+      ui["multi_operator_edit_absolute"] =
+          data.ui_preferences.multi_operator_edit_absolute;
+      ui["envelope_reference_midi_note"] =
+          data.ui_preferences.envelope_reference_midi_note;
       ui["patch_sort_column"] = data.ui_preferences.patch_sort_column;
       ui["patch_sort_order"] = data.ui_preferences.patch_sort_order;
       ui["midi_keyboard_scale"] = data.ui_preferences.midi_keyboard_scale;

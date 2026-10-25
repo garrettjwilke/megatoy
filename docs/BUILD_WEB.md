@@ -25,7 +25,7 @@ emcmake cmake -S . -B build-web -DCMAKE_BUILD_TYPE=Release
 cmake --build build-web --target megatoy --parallel
 ```
 
-The build copies the required web bundle into `build-web/web-dist`. Serve the files from that directory, e.g.:
+The build copies the web bundle into `build-web/web_dist`. Serve it, e.g.:
 
 ```bash
 python3 -m http.server 8080 --directory ./build-web/web_dist
@@ -33,10 +33,29 @@ python3 -m http.server 8080 --directory ./build-web/web_dist
 
 Navigate to `http://localhost:8080/index.html` in a WebGL2-capable browser.
 
+## Troubleshooting
+
+### `Emscripten.cmake` or `emcc` not found after upgrading the SDK
+
+```
+include could not find requested file:
+  /opt/homebrew/Cellar/emscripten/<old version>/libexec/cmake/Modules/Platform/Emscripten.cmake
+```
+
+CMake caches the toolchain by absolute path, so a build directory configured
+against one Emscripten version stops working when the SDK is upgraded. Delete
+it and configure again:
+
+```bash
+rm -rf build-web
+emcmake cmake -S . -B build-web -DCMAKE_BUILD_TYPE=Release
+```
+
 ## Current limitations
 
-- Only the built-in preset library is available; importing user patches and metadata storage are disabled.
-- Exports trigger browser downloads (DMP and MML) instead of writing to disk.
-- WebMIDI input is not yet implemented; use the soft keyboard to audition patches.
-
-Future work includes browser storage for user patches and WebMIDI integration.
+- Unlike the desktop build, folders are imported rather than referenced.
+  "Import Folder into Workspace" copies the chosen tree into `/megatoy`, and
+  edits never reach the original folder -- use Download to get them back out.
+- Clearing site data removes the library. Download anything you want to keep.
+- MIDI input needs a browser with Web MIDI (Chromium-based) and one-time
+  permission, granted from Preferences.

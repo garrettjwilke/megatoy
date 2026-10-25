@@ -3,6 +3,7 @@
 #include "app_context.hpp"
 #include "app_services.hpp"
 #include "app_state.hpp"
+#include "core/status.hpp"
 #include "history/history_manager.hpp"
 #include "history/snapshot_entry.hpp"
 #include "patches/patch_session.hpp"
@@ -34,16 +35,10 @@ inline bool load(AppContext &context, const patches::PatchEntry &patch_info) {
   auto &patch_session = context.services.patch_session;
   const auto before = patch_session.capture_snapshot();
 
-  ym2612::Patch loaded_patch;
-  if (!patch_session.repository().load_patch(patch_info, loaded_patch)) {
-    std::cerr << "Failed to load preset patch: " << patch_info.name
-              << std::endl;
+  if (!patch_session.load_patch_from_entry(patch_info)) {
+    megatoy::status::error("Failed to load \"" + patch_info.name + "\"");
     return false;
   }
-
-  patch_session.current_patch() = loaded_patch;
-  patch_session.set_current_patch_path(patch_info.relative_path);
-  patch_session.apply_patch_to_audio();
 
   const auto after = patch_session.capture_snapshot();
   detail::record_change(context, "Load: " + patch_info.name, before, after);

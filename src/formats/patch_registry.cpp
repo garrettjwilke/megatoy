@@ -1,14 +1,23 @@
 #include "patch_registry.hpp"
 
-#include "ctrmml.hpp"
-#include "dmp.hpp"
-#include "fui.hpp"
-#include "gin.hpp"
 #include "ginpkg.hpp"
-#include "rym2612.hpp"
+#include "ym2612_format_adapter.hpp"
 #include <algorithm>
+#include <array>
+#include <fstream>
+#include <string_view>
 
 namespace formats {
+
+std::string SaveFormatInfo::display_name() const {
+  if (extension.empty()) {
+    return label;
+  }
+  if (label.empty()) {
+    return extension;
+  }
+  return extension + " (" + label + ")";
+}
 
 PatchRegistry &PatchRegistry::instance() {
   static PatchRegistry registry;
@@ -124,39 +133,111 @@ std::optional<std::filesystem::path> PatchRegistry::save_package(
   return handler->write_packaged(dir, patch, name);
 }
 
-std::vector<ExportFormatInfo> PatchRegistry::export_formats() const {
-  std::vector<ExportFormatInfo> formats;
+std::vector<SaveFormatInfo> PatchRegistry::save_formats() const {
+  std::vector<SaveFormatInfo> formats;
   formats.reserve(handlers_.size());
   for (const auto &[ext, handler] : handlers_) {
     if (handler.write_single) {
-      ExportFormatInfo info;
+      SaveFormatInfo info;
       info.extension = ext;
       info.label = handler.label.empty() ? ext : handler.label;
       info.is_text = false;
       formats.push_back(std::move(info));
     }
     if (handler.write_text) {
-      ExportFormatInfo info;
+      SaveFormatInfo info;
       info.extension = ext;
       info.label = handler.label.empty() ? ext : handler.label;
       info.is_text = true;
       formats.push_back(std::move(info));
     }
   }
+  static constexpr std::array<std::string_view, 7> kSaveOrder = {
+      ".gin", ".dmp", ".fui", ".eif", ".tfi", ".vgi", ".mml"};
+  for (auto &format : formats) {
+    if (format.extension == ".gin") {
+      format.label = "megatoy";
+    }
+  }
+  const auto rank = [](const std::string &extension) {
+    const auto found = std::find(kSaveOrder.begin(), kSaveOrder.end(),
+                                 extension);
+    return found == kSaveOrder.end()
+               ? kSaveOrder.size()
+               : static_cast<std::size_t>(found - kSaveOrder.begin());
+  };
   std::sort(formats.begin(), formats.end(),
-            [](const ExportFormatInfo &a, const ExportFormatInfo &b) {
-              return a.label < b.label;
+            [rank](const SaveFormatInfo &a, const SaveFormatInfo &b) {
+              const auto a_rank = rank(a.extension);
+              const auto b_rank = rank(b.extension);
+              return a_rank == b_rank ? a.label < b.label : a_rank < b_rank;
             });
   return formats;
 }
 void PatchRegistry::register_defaults() {
-  register_format(".gin",
-                  {formats::gin::read_file,
-                   [](const std::filesystem::path &dir,
-                      const ym2612::Patch &patch, const std::string &name) {
-                     return formats::gin::save_patch(dir, patch, name);
-                   },
-                   nullptr, nullptr, "GIN"});
+  // Everything ym2612_format supports is registered from its own table, so a
+  // format added upstream shows up here without further changes.
+  for (const auto &info : adapter::known_formats()) {
+    const auto format = info.format;
+
+    // .ginpkg stays megatoy's own: it is a versioned container with a patch
+    // history, which the library only reads.
+    if (format == ym2612_format::Format::Ginpkg) {
+      continue;
+    }
+
+    PatchFormatHandler handler;
+    handler.label = info.name;
+
+    if (info.can_read) {
+      handler.read_file = [format](const std::filesystem::path &path) {
+        return adapter::read_file(format, path);
+      };
+    }
+
+    if (info.can_write && info.is_text) {
+      handler.write_text = [format](const ym2612::Patch &patch,
+                                    const std::filesystem::path &target) {
+        auto text = adapter::serialize_text(format, patch);
+        if (!text) {
+          return false;
+        }
+        std::ofstream file(target);
+        if (!file) {
+          return false;
+        }
+        file << *text;
+        return static_cast<bool>(file);
+      };
+    } else if (info.can_write) {
+      handler.write_single = [format](const ym2612::Patch &patch,
+                                      const std::filesystem::path &target) {
+        return adapter::write_file(format, patch, target);
+      };
+    }
+
+    // .gin is megatoy's plain save format, so it also gets a packaged writer
+    // that names the file from the patch.
+    if (format == ym2612_format::Format::Gin) {
+      handler.write_packaged =
+          [format](
+              const std::filesystem::path &dir, const ym2612::Patch &patch,
+              const std::string &name) -> std::optional<std::filesystem::path> {
+        const auto path = dir / (name + ".gin");
+        return adapter::write_file(format, patch, path)
+                   ? std::optional<std::filesystem::path>(path)
+                   : std::nullopt;
+      };
+    }
+
+    // Aliases share the primary extension's handler (e.g. .vgz is a gzipped
+    // .vgm, which vgm::parse() decompresses transparently).
+    for (const auto &alias : info.aliases) {
+      register_format("." + alias, handler);
+    }
+    register_format(adapter::extension_for(format), std::move(handler));
+  }
+
   register_format(".ginpkg",
                   {formats::ginpkg::read_file,
                    [](const std::filesystem::path &dir,
@@ -164,16 +245,6 @@ void PatchRegistry::register_defaults() {
                      return formats::ginpkg::save_patch(dir, patch, name);
                    },
                    nullptr, nullptr, "GINPKG"});
-  register_format(".dmp", {formats::dmp::read_file, nullptr,
-                           formats::dmp::write_patch, nullptr, "DefleMask"});
-  register_format(".rym2612", {formats::rym2612::read_file, nullptr, nullptr,
-                               nullptr, "RYM2612"});
-  register_format(
-      ".fui",
-      {formats::fui::read_file, nullptr, formats::fui::write_patch, nullptr,
-       "Furnace"});
-  register_format(".mml", {formats::ctrmml::read_file, nullptr, nullptr,
-                           formats::ctrmml::write_patch, "ctrmml"});
 }
 
 } // namespace formats

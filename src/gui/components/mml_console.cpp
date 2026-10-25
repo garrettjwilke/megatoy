@@ -1,5 +1,6 @@
 #include "mml_console.hpp"
-#include "formats/ctrmml.hpp"
+#include "formats/ym2612_format_adapter.hpp"
+#include "gui/ui_scale.hpp"
 #include "platform/clipboard.hpp"
 #include <cstring>
 #include <imgui.h>
@@ -7,7 +8,8 @@
 namespace ui {
 
 void render_mml_console(const char *title, MmlConsoleContext &context) {
-  ImGui::SetNextWindowSize(ImVec2(300, 180), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ui::scale::px(ImVec2(300, 180)),
+                           ImGuiCond_FirstUseEver);
 
   if (!context.ui_prefs.show_mml_console) {
     return;
@@ -17,7 +19,9 @@ void render_mml_console(const char *title, MmlConsoleContext &context) {
     return;
   }
 
-  auto mml = formats::ctrmml::patch_to_string(context.current_patch());
+  auto mml = formats::adapter::serialize_text(ym2612_format::Format::Mml,
+                                              context.current_patch())
+                 .value_or(std::string{});
   auto mml_c = mml.c_str();
 
   // copy to clipboard button

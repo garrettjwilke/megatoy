@@ -1,0 +1,112 @@
+#include "../test_check.hpp"
+#include "gui/save_as_dialog.hpp"
+#include "patches/filename_utils.hpp"
+
+#include <filesystem>
+#include <iostream>
+
+namespace fs = std::filesystem;
+
+namespace {
+
+std::vector<formats::SaveFormatInfo> formats() {
+  return {
+      {".gin", "megatoy"}, {".dmp", "DefleMask"}, {".vgi", "VGM Music Maker"}};
+}
+
+void test_a_writable_extension_is_kept() {
+  CHECK(ui::default_save_as_extension(".gin", formats()) == ".gin");
+  CHECK(ui::default_save_as_extension(".vgi", formats()) == ".vgi");
+}
+
+void test_anything_else_falls_back() {
+  // Read-only formats and a patch with no file of its own alike.
+  CHECK(ui::default_save_as_extension(".opm", formats()) == ".dmp");
+  CHECK(ui::default_save_as_extension("", formats()) == ".dmp");
+  CHECK(ui::default_save_as_extension(".gin", {}) == ".dmp");
+}
+
+void test_the_patch_folder_wins_when_it_is_writable() {
+  CHECK(ui::default_save_as_folder(fs::path("/patches/mine"),
+                                   fs::path("/patches/default")) ==
+        fs::path("/patches/mine"));
+}
+
+void test_a_read_only_source_falls_back_to_the_default_folder() {
+  CHECK(
+      ui::default_save_as_folder(std::nullopt, fs::path("/patches/default")) ==
+      fs::path("/patches/default"));
+}
+
+void test_the_target_is_the_folder_the_name_and_the_format() {
+  CHECK(ui::save_as_target_path(fs::path("/patches/mine"), "Lead", ".dmp") ==
+        fs::path("/patches/mine/Lead.dmp"));
+  CHECK(ui::save_as_target_path(fs::path("/patches/mine"), "Bass", ".gin") ==
+        fs::path("/patches/mine/Bass.gin"));
+}
+
+void test_a_name_the_storage_would_change_is_changed_here_too() {
+  CHECK(ui::save_as_target_path(fs::path("/patches/mine"), "", ".gin") ==
+        fs::path("/patches/mine/patch.gin"));
+  CHECK(ui::save_as_target_path(fs::path("/patches/mine"), "a/b", ".gin") ==
+        fs::path("/patches/mine") /
+            (patches::sanitize_filename("a/b") + ".gin"));
+}
+
+void test_a_copy_is_named_after_what_it_copies() {
+  CHECK(ui::duplicate_stem("init") == "init copy");
+  CHECK(ui::duplicate_stem("Lead 2") == "Lead 2 copy");
+  // Nothing to name it after: the same fallback the target path uses.
+  CHECK(ui::duplicate_stem("") == "patch copy");
+}
+
+void test_the_dialog_opens_on_a_folder_it_offers() {
+  const std::vector<megatoy::workspace::Folder> choices{
+      {fs::path("/patches/first"), "first"},
+      {fs::path("/patches/last"), "last"}};
+  CHECK(ui::save_as_initial_folder(choices, fs::path("/patches/last")) ==
+        fs::path("/patches/last"));
+  CHECK(ui::save_as_initial_folder(choices, fs::path("/patches/elsewhere")) ==
+        fs::path("/patches/first"));
+  CHECK(ui::save_as_initial_folder({}, fs::path("/patches/first")).empty());
+}
+
+void test_the_folder_row_appears_only_when_there_is_a_choice() {
+  const std::vector<megatoy::workspace::Folder> one{
+      {fs::path("/patches/only"), "only"}};
+  const std::vector<megatoy::workspace::Folder> two{
+      {fs::path("/patches/first"), "first"},
+      {fs::path("/patches/last"), "last"}};
+  CHECK(!ui::save_as_shows_folder_choice({}));
+  CHECK(!ui::save_as_shows_folder_choice(one));
+  CHECK(ui::save_as_shows_folder_choice(two));
+}
+
+void test_only_writable_folders_are_offered_in_order() {
+  const std::vector<megatoy::workspace::Folder> folders{
+      {fs::path("/patches/first"), "first", true, true},
+      {fs::path("/patches/locked"), "locked", true, false},
+      {fs::path("/patches/last"), "last", true, true}};
+  const auto choices = ui::save_as_folder_choices(folders);
+  CHECK(choices.size() == 2);
+  CHECK(choices[0].path == fs::path("/patches/first"));
+  CHECK(choices[1].path == fs::path("/patches/last"));
+}
+
+} // namespace
+
+int main() {
+  test_a_writable_extension_is_kept();
+  test_anything_else_falls_back();
+  test_the_patch_folder_wins_when_it_is_writable();
+  test_a_read_only_source_falls_back_to_the_default_folder();
+  test_the_target_is_the_folder_the_name_and_the_format();
+  test_a_name_the_storage_would_change_is_changed_here_too();
+  test_a_copy_is_named_after_what_it_copies();
+  test_the_dialog_opens_on_a_folder_it_offers();
+  test_the_folder_row_appears_only_when_there_is_a_choice();
+  test_only_writable_folders_are_offered_in_order();
+
+  std::cout << "All Save As dialog tests passed\n";
+  return 0;
+}

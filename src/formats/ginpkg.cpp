@@ -4,8 +4,8 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
@@ -76,9 +76,8 @@ std::string generate_uuid() {
 std::optional<std::string> read_zip_entry(mz_zip_archive &archive,
                                           const std::string &name) {
   size_t size = 0;
-  char *buffer =
-      static_cast<char *>(mz_zip_reader_extract_file_to_heap(
-          &archive, name.c_str(), &size, 0));
+  char *buffer = static_cast<char *>(
+      mz_zip_reader_extract_file_to_heap(&archive, name.c_str(), &size, 0));
   if (!buffer) {
     return std::nullopt;
   }
@@ -90,12 +89,12 @@ std::optional<std::string> read_zip_entry(mz_zip_archive &archive,
 bool write_zip_entry(mz_zip_archive &archive, const std::string &name,
                      const std::string &content) {
   return mz_zip_writer_add_mem_ex(&archive, name.c_str(), content.data(),
-                                  content.size(), nullptr, 0,
-                                  MZ_NO_COMPRESSION, 0, 0) != 0;
+                                  content.size(), nullptr, 0, MZ_NO_COMPRESSION,
+                                  0, 0) != 0;
 }
 
-nlohmann::json history_to_json(
-    const std::vector<formats::ginpkg::HistoryEntry> &history) {
+nlohmann::json
+history_to_json(const std::vector<formats::ginpkg::HistoryEntry> &history) {
   nlohmann::json versions = nlohmann::json::array();
   for (const auto &entry : history) {
     nlohmann::json node = {{"uuid", entry.uuid},
@@ -146,10 +145,11 @@ std::optional<std::string> GinPackage::snapshot(const std::string &uuid) const {
 
 bool GinPackage::DeleteVersion(const std::string &uuid) {
   const auto before_size = history_.size();
-  history_.erase(
-      std::remove_if(history_.begin(), history_.end(),
-                     [&](const HistoryEntry &entry) { return entry.uuid == uuid; }),
-      history_.end());
+  history_.erase(std::remove_if(history_.begin(), history_.end(),
+                                [&](const HistoryEntry &entry) {
+                                  return entry.uuid == uuid;
+                                }),
+                 history_.end());
   snapshots_.erase(uuid);
   return history_.size() != before_size;
 }
@@ -161,8 +161,8 @@ void GinPackage::AddVersion(const std::string &json_snapshot,
   }
   HistoryEntry entry;
   entry.uuid = generate_uuid();
-  entry.timestamp = current_timestamp_.empty() ? iso8601_utc_timestamp()
-                                               : current_timestamp_;
+  entry.timestamp =
+      current_timestamp_.empty() ? iso8601_utc_timestamp() : current_timestamp_;
   if (!comment.empty()) {
     entry.comment = comment;
   }
@@ -197,8 +197,7 @@ bool GinPackage::Load(const std::filesystem::path &path) {
 
   auto current = read_zip_entry(archive, kCurrentFile);
   if (!current) {
-    std::cerr << "ginpkg missing " << kCurrentFile << ": " << path
-              << std::endl;
+    std::cerr << "ginpkg missing " << kCurrentFile << ": " << path << std::endl;
     return false;
   }
 
@@ -221,8 +220,7 @@ bool GinPackage::Load(const std::filesystem::path &path) {
               version["timestamp"].is_string()) {
             entry.timestamp = version["timestamp"].get<std::string>();
           }
-          if (version.contains("comment") &&
-              version["comment"].is_string()) {
+          if (version.contains("comment") && version["comment"].is_string()) {
             auto value = version["comment"].get<std::string>();
             if (!value.empty()) {
               entry.comment = value;
@@ -240,8 +238,8 @@ bool GinPackage::Load(const std::filesystem::path &path) {
         }
       }
     } catch (const std::exception &e) {
-      std::cerr << "Failed to parse history.json in " << path
-                << ": " << e.what() << std::endl;
+      std::cerr << "Failed to parse history.json in " << path << ": "
+                << e.what() << std::endl;
       history_.clear();
       current_timestamp_.clear();
     }
@@ -328,8 +326,9 @@ build_package_path(const std::filesystem::path &patches_dir,
                    const std::string &filename) {
   std::string full_filename = filename;
   std::string lower = full_filename;
-  std::transform(lower.begin(), lower.end(), lower.begin(),
-                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  std::transform(
+      lower.begin(), lower.end(), lower.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   if (!lower.ends_with(".ginpkg")) {
     full_filename += ".ginpkg";
   }
@@ -337,9 +336,8 @@ build_package_path(const std::filesystem::path &patches_dir,
 }
 
 const std::optional<std::filesystem::path>
-save_patch(const std::filesystem::path &patches_dir,
-           const ym2612::Patch &patch, const std::string &filename,
-           const std::string &comment) {
+save_patch(const std::filesystem::path &patches_dir, const ym2612::Patch &patch,
+           const std::string &filename, const std::string &comment) {
   try {
     auto package_path = build_package_path(patches_dir, filename);
     GinPackage package;
@@ -366,19 +364,19 @@ save_patch(const std::filesystem::path &patches_dir,
   }
 }
 
-std::vector<ym2612::Patch> read_file(const std::filesystem::path &package_path) {
+std::vector<ym2612::Patch>
+read_file(const std::filesystem::path &package_path) {
   try {
-    GinPackage package;
-    if (!package.Load(package_path)) {
+    auto package = load_package(package_path);
+    if (!package) {
       return {};
     }
-
-    nlohmann::json j = nlohmann::json::parse(package.current_data());
-    ym2612::Patch patch = j.get<ym2612::Patch>();
-    return {patch};
+    auto patch = read_current(*package);
+    return patch ? std::vector<ym2612::Patch>{std::move(*patch)}
+                 : std::vector<ym2612::Patch>{};
   } catch (const std::exception &e) {
-    std::cerr << "Failed to load ginpkg '" << package_path
-              << "': " << e.what() << std::endl;
+    std::cerr << "Failed to load ginpkg '" << package_path << "': " << e.what()
+              << std::endl;
     return {};
   }
 }
@@ -391,6 +389,33 @@ std::optional<GinPackage> load_package(const std::filesystem::path &path) {
   return package;
 }
 
+std::optional<ym2612::Patch> read_current(const GinPackage &package) {
+  try {
+    auto json = nlohmann::json::parse(package.current_data());
+    return json.get<ym2612::Patch>();
+  } catch (const std::exception &e) {
+    std::cerr << "Failed to load current ginpkg patch: " << e.what()
+              << std::endl;
+    return std::nullopt;
+  }
+}
+
+std::optional<ym2612::Patch> read_version(const GinPackage &package,
+                                          const std::string &uuid) {
+  try {
+    auto snapshot = package.snapshot(uuid);
+    if (!snapshot) {
+      return std::nullopt;
+    }
+    auto json = nlohmann::json::parse(*snapshot);
+    return json.get<ym2612::Patch>();
+  } catch (const std::exception &e) {
+    std::cerr << "Failed to load ginpkg version '" << uuid << "': " << e.what()
+              << std::endl;
+    return std::nullopt;
+  }
+}
+
 std::optional<ym2612::Patch> read_version(const std::filesystem::path &path,
                                           const std::string &uuid) {
   try {
@@ -398,16 +423,10 @@ std::optional<ym2612::Patch> read_version(const std::filesystem::path &path,
     if (!package) {
       return std::nullopt;
     }
-    auto snapshot = package->snapshot(uuid);
-    if (!snapshot) {
-      return std::nullopt;
-    }
-    auto json = nlohmann::json::parse(*snapshot);
-    ym2612::Patch patch = json.get<ym2612::Patch>();
-    return patch;
+    return read_version(*package, uuid);
   } catch (const std::exception &e) {
-    std::cerr << "Failed to load ginpkg version '" << uuid
-              << "' from " << path << ": " << e.what() << std::endl;
+    std::cerr << "Failed to load ginpkg version '" << uuid << "' from " << path
+              << ": " << e.what() << std::endl;
     return std::nullopt;
   }
 }
@@ -424,8 +443,8 @@ bool delete_version(const std::filesystem::path &path,
     }
     return package->Save(path);
   } catch (const std::exception &e) {
-    std::cerr << "Failed to delete ginpkg version '" << uuid
-              << "' from " << path << ": " << e.what() << std::endl;
+    std::cerr << "Failed to delete ginpkg version '" << uuid << "' from "
+              << path << ": " << e.what() << std::endl;
     return false;
   }
 }

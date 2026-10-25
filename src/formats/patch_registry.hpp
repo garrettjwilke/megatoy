@@ -1,7 +1,7 @@
 #pragma once
 
-#include "patch_loader.hpp"
 #include "../ym2612/patch.hpp"
+#include "patch_loader.hpp"
 #include <filesystem>
 #include <functional>
 #include <optional>
@@ -16,21 +16,31 @@ struct PatchFormatHandler {
       read_file;
   // Optional writers for export/save; not all formats support these.
   std::function<std::optional<std::filesystem::path>(
-      const std::filesystem::path &, const ym2612::Patch &, const std::string &)>
+      const std::filesystem::path &, const ym2612::Patch &,
+      const std::string &)>
       write_packaged; // writes to directory + name
   std::function<bool(const ym2612::Patch &,
                      const std::filesystem::path &)>
       write_single; // writes to explicit path
-  std::function<bool(const ym2612::Patch &,
-                     const std::filesystem::path &)> write_text;
+  std::function<bool(const ym2612::Patch &, const std::filesystem::path &)>
+      write_text;
   // Label to present in UI.
   std::string label;
 };
 
-struct ExportFormatInfo {
+struct SaveFormatInfo {
   std::string extension;
   std::string label;
   bool is_text = false;
+
+  /**
+   * How this format is named wherever the UI offers a choice of formats:
+   * extension first, e.g. ".gin (megatoy)".
+   *
+   * The only place that spelling is built. Every format picker calls this so
+   * they cannot drift apart.
+   */
+  std::string display_name() const;
 };
 
 class PatchRegistry {
@@ -52,7 +62,7 @@ public:
   std::optional<std::filesystem::path>
   save_package(const std::string &extension, const std::filesystem::path &dir,
                const std::string &name, const ym2612::Patch &patch) const;
-  std::vector<ExportFormatInfo> export_formats() const;
+  std::vector<SaveFormatInfo> save_formats() const;
 
 private:
   PatchRegistry();

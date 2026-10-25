@@ -28,8 +28,8 @@ Changes apply directly to your active patch with full undo support.
 
 ### Patch Management
 
-- **Load patches** from multiple formats: DefleMask (`.dmp`), Furnace (`.fui`), [ctrmml](https://github.com/superctr/ctrmml)/ [mmlgui](https://github.com/superctr/mmlgui) (`.mml`), `.rym2612`
-- **Export patches** to multiple formats: `.dmp`, `.fui`, `.mml`
+- **Load patches** from many formats, via [ym2612_format](https://github.com/ulalume/ym2612_format): DefleMask preset (`.dmp`) and module (`.dmf`), Furnace instrument (`.fui`) and module (`.fur`), [ctrmml](https://github.com/superctr/ctrmml)/ [mmlgui](https://github.com/superctr/mmlgui) (`.mml`), VOPM/MiOPMdrv (`.opm`), TFM Music Maker (`.tfi`), `.rym2612`, VGM Music Maker (`.vgi`), Echo (`.eif`), Sona (`.spat`), TYI (`.tyi`), Gens KMod (`.y12`), YM2612 Instrument Editor (`.dat`), MVS Tracker MD (`.ins`), VGM/VGZ register log (`.vgm`/`.vgz`)
+- **Save patches as** `.gin`, `.dmp`, `.fui`, `.eif`, `.spat`, `.tfi`, `.tyi`, `.vgi`, `.y12`, or `.mml`
 - **Organize patches** with metadata (star ratings and categories) for quick retrieval and filtering
 - **Drag & drop** support for easy file loading
 
@@ -52,7 +52,11 @@ Changes apply directly to your active patch with full undo support.
 
 ## Patch Sources
 
-Load patches by placing files in `~/megatoy/patches/` (created automatically) or drag-and-drop into the application.
+You add folders of patches and it reads them where they are.
+
+- **File ▸ Add Folder to Workspace...** — add as many folders as you like.
+- **Drag & drop** a patch file onto the window to load it without adding a folder.
+- Star ratings and categories are stored in a `.megatoy/patches.json` sidecar inside each folder.
 
 Built-in patches:
 
@@ -67,8 +71,8 @@ Recommended external collections:
 ## Build Instructions
 
 ```bash
-# Clone repository (--recursive fetches the built-in preset patches)
-git clone --recursive https://github.com/ulalume/megatoy.git
+# Clone repository (CMake fetches the built-in preset patches at configure time)
+git clone https://github.com/ulalume/megatoy.git
 cd megatoy
 
 # Debug build
@@ -80,19 +84,15 @@ cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release --config Release --parallel
 ```
 
-If you already cloned without `--recursive`, run:
-
-```bash
-git submodule update --init
-```
-
 For distribution-specific notes on dependencies and audio drivers, see the Linux guide at [docs/BUILD_LINUX.md](docs/BUILD_LINUX.md).
 
 For experimental WebAssembly builds, see [docs/BUILD_WEB.md](docs/BUILD_WEB.md).
 
 ## Thanks
 
-- [libvgm](https://github.com/ValleyBell/libvgm/)
+- [Nuked-OPN2](https://github.com/nukeykt/Nuked-OPN2) - YM2612 emulation core
+- [ymfm](https://github.com/aaronsgiles/ymfm) - YM2612 emulation core
+- [libvgm](https://github.com/ValleyBell/libvgm/) - sample rate conversion
 - [YM2612 registers reference](https://plutiedev.com/ym2612-registers)
 - [Official manual](https://segaretro.org/images/e/ef/YM2612_manual.pdf)
 - [Emulating the YM2612](https://jsgroth.dev/blog/posts/emulating-ym2612-part-1/)
